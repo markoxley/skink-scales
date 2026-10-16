@@ -1,0 +1,943 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: Scales — Official package manager and module resolution system
+//          for the Skink programming language.
+//
+// File:    pkg/cache.skink
+// Purpose: Implements the APT/DNF-style local package cache, local metadata
+//          index cache, cross-platform path helpers, and GitHub tag/archive
+//          fetching.
+// Author:  Mark Oxley
+// Created: 2026
+
+module cache
+
+import "std/str"
+import "std/fs"
+import "std/os"
+import "std/json"
+import "std/crypto"
+import "std/time"
+import "std/strconv"
+import "std/errors"
+import "pkg/semver"
+import "pkg/modres"
+import "pkg/manifest"
+
+// RepoIndexEntry stores cached metadata for a single <owner>/<repo> in the
+// local index cache (<cache_root>/index/<owner>/<repo>/tags.json).
+pub struct RepoIndexEntry {
+    Owner:       string   // GitHub owner
+    Repo:        string   // GitHub repository name
+    Latest:      string   // Highest resolved version tag
+    Tags:        []string // Available version tags sorted newest-first
+    UpdatedUnix: int      // Unix timestamp when index entry was last refreshed
+}
+
+// CachedPackage describes a package version installed in the local cache.
+pub struct CachedPackage {
+    Key:        string // Canonical module key: "mod/<owner>/<repo>"
+    Owner:      string // GitHub owner
+    Repo:       string // GitHub repository name
+    Version:    string // Cached version tag (e.g. "v1.0.2")
+    InstallDir: string // Local filesystem path to extracted package
+    Archive:    string // Local filesystem path to cached archive (if any)
+    Sha256:     string // SHA-256 integrity hash
+    Source:     string // Origin URL or mirror path
+    FromCache:  bool   // True if satisfied from local cache without network fetch
+}
+
+// IsWindows reports whether the current host platform is Windows.
+pub fn IsWindows() -> bool {
+    osEnv := os.Getenv("OS")
+    return str.Equal(osEnv, "Windows_NT")
+}
+
+// NormalizePath normalizes all path separators to '/' and strips trailing
+// slashes (except for root "/").
+pub fn NormalizePath(p: string) -> string {
+    if str.Len(p) == 0 {
+        return ""
+    }
+    s := str.Replace(p, "\\", "/")
+    for str.Len(s) > 1 && str.EndsWith(s, "/") {
+        s = str.Substr(s, 0, str.Len(s) - 1)
+    }
+    return s
+}
+
+// ToNativePath converts a normalized '/' path to the host OS path separator.
+pub fn ToNativePath(p: string) -> string {
+    if IsWindows() {
+        return str.Replace(p, "/", "\\")
+    }
+    return p
+}
+
+// JoinPath joins two path segments using '/'.
+pub fn JoinPath(a: string, b: string) -> string {
+    na := NormalizePath(a)
+    nb := str.Replace(b, "\\", "/")
+    for str.StartsWith(nb, "/") {
+        nb = str.Substr(nb, 1, str.Len(nb) - 1)
+    }
+    if str.Len(na) == 0 {
+        return nb
+    }
+    if str.Len(nb) == 0 {
+        return na
+    }
+    if str.Equal(na, "/") {
+        return str.Concat("/", nb)
+    }
+    return str.Concat(na, str.Concat("/", nb))
+}
+
+// HomeDir returns the current user's home directory across Linux, macOS, and Windows.
+pub fn HomeDir() -> string {
+    h := os.Getenv("HOME")
+    if int64(h) != 0 && str.Len(h) > 0 {
+        return NormalizePath(h)
+    }
+    up := os.Getenv("USERPROFILE")
+    if int64(up) != 0 && str.Len(up) > 0 {
+        return NormalizePath(up)
+    }
+    la := os.Getenv("LOCALAPPDATA")
+    if int64(la) != 0 && str.Len(la) > 0 {
+        return NormalizePath(la)
+    }
+    return "."
+}
+
+// GetCacheRoot returns the root directory of the local scales cache.
+// Precedence:
+//   1. $SCALES_CACHE_DIR
+//   2. $SKINK_PREFIX/scales
+//   3. ~/.local/skink/scales (or %USERPROFILE%/.local/skink/scales on Windows)
+pub fn GetCacheRoot() -> string {
+    envCache := os.Getenv("SCALES_CACHE_DIR")
+    if int64(envCache) != 0 && str.Len(envCache) > 0 {
+        return NormalizePath(envCache)
+    }
+    prefix := os.Getenv("SKINK_PREFIX")
+    if int64(prefix) != 0 && str.Len(prefix) > 0 {
+        return JoinPath(prefix, "scales")
+    }
+    return JoinPath(HomeDir(), ".local/skink/scales")
+}
+
+// MkdirAll recursively creates a directory path and all missing parent directories.
+pub fn MkdirAll(dirPath: string) -> errors.Error {
+    norm := NormalizePath(dirPath)
+    if str.Len(norm) == 0 || str.Equal(norm, ".") || str.Equal(norm, "/") {
+        return errors.New("")
+    }
+    if fs.IsDir(norm) {
+        return errors.New("")
+    }
+    parts := str.Split(norm, "/")
+    cur := ""
+    if str.StartsWith(norm, "/") {
+        cur = "/"
+    }
+    for i := 0; i < len(parts); i = i + 1 {
+        seg := parts[i]
+        if str.Len(seg) == 0 {
+            continue
+        }
+        // Handle Windows drive letter prefix like "C:"
+        if i == 0 && str.EndsWith(seg, ":") {
+            cur = seg
+            continue
+        }
+        if str.Len(cur) == 0 {
+            cur = seg
+        } else if str.Equal(cur, "/") {
+            cur = str.Concat("/", seg)
+        } else {
+            cur = str.Concat(cur, str.Concat("/", seg))
+        }
+        if !fs.IsDir(cur) {
+            err := fs.Mkdir(cur)
+            if err.message != "" && !fs.IsDir(cur) {
+                return err
+            }
+        }
+    }
+    return errors.New("")
+}
+
+// EnsureCacheDirs initializes the APT/DNF-style cache hierarchy:
+//   <root>/index/
+//   <root>/archives/
+//   <root>/packages/
+pub fn EnsureCacheDirs() -> errors.Error {
+    root := GetCacheRoot()
+    err := MkdirAll(JoinPath(root, "index"))
+    if err.message != "" {
+        return err
+    }
+    err = MkdirAll(JoinPath(root, "archives"))
+    if err.message != "" {
+        return err
+    }
+    return MkdirAll(JoinPath(root, "packages"))
+}
+
+// PackageCacheDir returns the directory where a specific version of a package
+// is extracted: <cache_root>/packages/<owner>/<repo>/<version>.
+pub fn PackageCacheDir(owner: string, repo: string, version: string) -> string {
+    root := GetCacheRoot()
+    return JoinPath(JoinPath(JoinPath(JoinPath(root, "packages"), owner), repo), version)
+}
+
+// RepoPackagesDir returns <cache_root>/packages/<owner>/<repo>.
+pub fn RepoPackagesDir(owner: string, repo: string) -> string {
+    root := GetCacheRoot()
+    return JoinPath(JoinPath(JoinPath(root, "packages"), owner), repo)
+}
+
+// ArchiveCachePath returns <cache_root>/archives/<owner>__<repo>__<version>.tar.gz.
+pub fn ArchiveCachePath(owner: string, repo: string, version: string) -> string {
+    root := GetCacheRoot()
+    fname := str.Concat(owner, str.Concat("__", str.Concat(repo, str.Concat("__", str.Concat(version, ".tar.gz")))))
+    return JoinPath(JoinPath(root, "archives"), fname)
+}
+
+// RepoIndexPath returns <cache_root>/index/<owner>/<repo>/tags.json.
+pub fn RepoIndexPath(owner: string, repo: string) -> string {
+    root := GetCacheRoot()
+    return JoinPath(JoinPath(JoinPath(JoinPath(root, "index"), owner), repo), "tags.json")
+}
+
+// GlobalIndexPath returns <cache_root>/index/index.json.
+pub fn GlobalIndexPath() -> string {
+    return JoinPath(JoinPath(GetCacheRoot(), "index"), "index.json")
+}
+
+// LoadRepoIndex reads the cached metadata index for <owner>/<repo> if available.
+pub fn LoadRepoIndex(owner: string, repo: string) -> (RepoIndexEntry, bool) {
+    idxPath := RepoIndexPath(owner, repo)
+    if !fs.IsFile(idxPath) {
+        var empty []string
+        return RepoIndexEntry{Owner: owner, Repo: repo, Latest: "", Tags: empty, UpdatedUnix: 0}, false
+    }
+    raw, err := fs.ReadAll(idxPath)
+    if err.message != "" || str.Len(raw) == 0 {
+        var empty []string
+        return RepoIndexEntry{Owner: owner, Repo: repo, Latest: "", Tags: empty, UpdatedUnix: 0}, false
+    }
+    val, jerr := json.Unmarshal(raw)
+    if jerr.message != "" {
+        var empty []string
+        return RepoIndexEntry{Owner: owner, Repo: repo, Latest: "", Tags: empty, UpdatedUnix: 0}, false
+    }
+    latest := json.GetString(val, "latest")
+    updated := json.GetInt(val, "updated_unix")
+    tagsArr := json.GetArray(val, "tags")
+    var tags []string
+    n := json.ArrayLen(tagsArr)
+    for i := 0; i < n; i = i + 1 {
+        t := json.AsString(json.ArrayGet(tagsArr, i))
+        if str.Len(t) > 0 {
+            tags = append(tags, t)
+        }
+    }
+    return RepoIndexEntry{
+        Owner:       owner,
+        Repo:        repo,
+        Latest:      latest,
+        Tags:        tags,
+        UpdatedUnix: updated
+    }, true
+}
+
+// SaveRepoIndex writes the metadata index entry for <owner>/<repo> to the
+// local index cache and updates the global summary index.
+pub fn SaveRepoIndex(entry: RepoIndexEntry) -> errors.Error {
+    err := EnsureCacheDirs()
+    if err.message != "" {
+        return err
+    }
+    idxPath := RepoIndexPath(entry.Owner, entry.Repo)
+    dir := JoinPath(JoinPath(JoinPath(GetCacheRoot(), "index"), entry.Owner), entry.Repo)
+    err = MkdirAll(dir)
+    if err.message != "" {
+        return err
+    }
+    var tagVals []json.Value
+    for i := 0; i < len(entry.Tags); i = i + 1 {
+        tagVals = append(tagVals, json.FromString(entry.Tags[i]))
+    }
+    keys := []string{"owner", "repo", "latest", "updated_unix", "tags"}
+    vals := []json.Value{
+        json.FromString(entry.Owner),
+        json.FromString(entry.Repo),
+        json.FromString(entry.Latest),
+        json.FromNumber(float(entry.UpdatedUnix)),
+        json.FromArray(tagVals)
+    }
+    obj := json.FromObject(keys, vals)
+    werr := fs.WriteAll(idxPath, json.MarshalValue(obj))
+    if werr.message != "" {
+        return werr
+    }
+    updateGlobalIndex(entry)
+    return errors.New("")
+}
+
+// updateGlobalIndex updates the top-level local metadata index summary file
+// (<cache_root>/index/index.json) with the latest version for entry.
+fn updateGlobalIndex(entry: RepoIndexEntry) {
+    gPath := GlobalIndexPath()
+    modKey := str.Concat("mod/", str.Concat(entry.Owner, str.Concat("/", entry.Repo)))
+    var keys []string
+    var vals []json.Value
+    found := false
+    if fs.IsFile(gPath) {
+        raw, err := fs.ReadAll(gPath)
+        if err.message == "" && str.Len(raw) > 0 {
+            existing, jerr := json.Unmarshal(raw)
+            if jerr.message == "" {
+                n := json.ObjectLen(existing)
+                for i := 0; i < n; i = i + 1 {
+                    k, v := json.ObjectGetByIndex(existing, i)
+                    keys = append(keys, k)
+                    if str.Equal(k, modKey) {
+                        vals = append(vals, json.FromString(entry.Latest))
+                        found = true
+                    } else {
+                        vals = append(vals, v)
+                    }
+                }
+            }
+        }
+    }
+    if !found {
+        keys = append(keys, modKey)
+        vals = append(vals, json.FromString(entry.Latest))
+    }
+    fs.WriteAll(gPath, json.MarshalValue(json.FromObject(keys, vals)))
+}
+
+// ListCachedVersions returns all versions of <owner>/<repo> currently unpacked
+// in <cache_root>/packages/<owner>/<repo>/.
+pub fn ListCachedVersions(owner: string, repo: string) -> []string {
+    var versions []string
+    repoDir := RepoPackagesDir(owner, repo)
+    if !fs.IsDir(repoDir) {
+        return versions
+    }
+    entries, err := fs.ReadDir(repoDir)
+    if err.message != "" {
+        return versions
+    }
+    for i := 0; i < len(entries); i = i + 1 {
+        if entries[i].IsDir && !str.StartsWith(entries[i].Name, ".") {
+            versions = append(versions, entries[i].Name)
+        }
+    }
+    return semver.SortTagsDesc(versions)
+}
+
+// ListAllCachedPackages scans <cache_root>/packages/ and returns all cached
+// package versions on the host machine.
+pub fn ListAllCachedPackages() -> []CachedPackage {
+    var result []CachedPackage
+    pkgsRoot := JoinPath(GetCacheRoot(), "packages")
+    if !fs.IsDir(pkgsRoot) {
+        return result
+    }
+    owners, err := fs.ReadDir(pkgsRoot)
+    if err.message != "" {
+        return result
+    }
+    for i := 0; i < len(owners); i = i + 1 {
+        if !owners[i].IsDir || str.StartsWith(owners[i].Name, ".") {
+            continue
+        }
+        owner := owners[i].Name
+        ownerDir := JoinPath(pkgsRoot, owner)
+        repos, rerr := fs.ReadDir(ownerDir)
+        if rerr.message != "" {
+            continue
+        }
+        for j := 0; j < len(repos); j = j + 1 {
+            if !repos[j].IsDir || str.StartsWith(repos[j].Name, ".") {
+                continue
+            }
+            repo := repos[j].Name
+            vers := ListCachedVersions(owner, repo)
+            for k := 0; k < len(vers); k = k + 1 {
+                v := vers[k]
+                installDir := PackageCacheDir(owner, repo, v)
+                sha, src := readPackageMeta(installDir)
+                result = append(result, CachedPackage{
+                    Key:        str.Concat("mod/", str.Concat(owner, str.Concat("/", repo))),
+                    Owner:      owner,
+                    Repo:       repo,
+                    Version:    v,
+                    InstallDir: installDir,
+                    Archive:    ArchiveCachePath(owner, repo, v),
+                    Sha256:     sha,
+                    Source:     src,
+                    FromCache:  true
+                })
+            }
+        }
+    }
+    return result
+}
+
+// readPackageMeta reads the .scales_meta.json file inside an installed package
+// directory, returning (sha256, source).
+fn readPackageMeta(installDir: string) -> (string, string) {
+    metaPath := JoinPath(installDir, ".scales_meta.json")
+    if !fs.IsFile(metaPath) {
+        return "", ""
+    }
+    raw, err := fs.ReadAll(metaPath)
+    if err.message != "" {
+        return "", ""
+    }
+    val, jerr := json.Unmarshal(raw)
+    if jerr.message != "" {
+        return "", ""
+    }
+    return json.GetString(val, "sha256"), json.GetString(val, "source")
+}
+
+// writePackageMeta writes .scales_meta.json inside an installed package directory.
+fn writePackageMeta(installDir: string, owner: string, repo: string, version: string, sha256: string, source: string) -> errors.Error {
+    metaPath := JoinPath(installDir, ".scales_meta.json")
+    keys := []string{"owner", "repo", "version", "sha256", "source", "installed_unix"}
+    vals := []json.Value{
+        json.FromString(owner),
+        json.FromString(repo),
+        json.FromString(version),
+        json.FromString(sha256),
+        json.FromString(source),
+        json.FromNumber(float(time.Timestamp()))
+    }
+    obj := json.FromObject(keys, vals)
+    return fs.WriteAll(metaPath, json.MarshalValue(obj))
+}
+
+// ComputePackageHash computes a deterministic SHA-256 hex digest over all
+// .skink and skink.toml files in a package directory.
+pub fn ComputePackageHash(pkgDir: string) -> string {
+    entries, err := fs.ReadDir(pkgDir)
+    if err.message != "" {
+        return crypto.Sha256Hex(pkgDir)
+    }
+    b := str.NewBuilder(1024)
+    for i := 0; i < len(entries); i = i + 1 {
+        name := entries[i].Name
+        if str.StartsWith(name, ".") {
+            continue
+        }
+        full := JoinPath(pkgDir, name)
+        if !entries[i].IsDir && (str.EndsWith(name, ".skink") || str.Equal(name, "skink.toml")) {
+            content, rerr := fs.ReadAll(full)
+            if rerr.message == "" {
+                b.Write(name)
+                b.Write(":")
+                b.Write(content)
+                b.Write("\n")
+            }
+        }
+    }
+    combined := b.String()
+    b.Free()
+    return crypto.Sha256Hex(combined)
+}
+
+// copyDirRecursive copies all files and subdirectories from srcDir to dstDir.
+fn copyDirRecursive(srcDir: string, dstDir: string) -> errors.Error {
+    err := MkdirAll(dstDir)
+    if err.message != "" {
+        return err
+    }
+    entries, rerr := fs.ReadDir(srcDir)
+    if rerr.message != "" {
+        return rerr
+    }
+    for i := 0; i < len(entries); i = i + 1 {
+        name := entries[i].Name
+        if str.Equal(name, ".git") {
+            continue
+        }
+        srcPath := JoinPath(srcDir, name)
+        dstPath := JoinPath(dstDir, name)
+        if entries[i].IsDir {
+            cerr := copyDirRecursive(srcPath, dstPath)
+            if cerr.message != "" {
+                return cerr
+            }
+        } else {
+            data, ferr := fs.ReadAll(srcPath)
+            if ferr.message != "" {
+                return ferr
+            }
+            werr := fs.WriteAll(dstPath, data)
+            if werr.message != "" {
+                return werr
+            }
+        }
+    }
+    return errors.New("")
+}
+
+// removeDirRecursive removes all files and subdirectories inside dirPath.
+pub fn RemoveDirRecursive(dirPath: string) -> errors.Error {
+    if !fs.Exists(dirPath) {
+        return errors.New("")
+    }
+    if !fs.IsDir(dirPath) {
+        return fs.Remove(dirPath)
+    }
+    entries, err := fs.ReadDir(dirPath)
+    if err.message == "" {
+        for i := 0; i < len(entries); i = i + 1 {
+            child := JoinPath(dirPath, entries[i].Name)
+            if entries[i].IsDir {
+                RemoveDirRecursive(child)
+            } else {
+                fs.Remove(child)
+            }
+        }
+    }
+    return fs.Remove(dirPath)
+}
+
+// parseGitLsRemoteTags extracts tag names from `git ls-remote --tags --refs` output.
+fn parseGitLsRemoteTags(output: string) -> []string {
+    var tags []string
+    lines := str.Split(output, "\n")
+    for i := 0; i < len(lines); i = i + 1 {
+        line := str.Trim(str.Replace(lines[i], "\r", ""))
+        if str.Len(line) == 0 {
+            continue
+        }
+        idx := str.IndexOf(line, "refs/tags/")
+        if idx >= 0 {
+            tag := str.Trim(str.Substr(line, idx + 10, str.Len(line) - idx - 10))
+            // Ignore peeled ^{} tag references if present.
+            if str.Len(tag) > 0 && !str.EndsWith(tag, "^{}") {
+                tags = append(tags, tag)
+            }
+        }
+    }
+    return semver.SortTagsDesc(tags)
+}
+
+// FetchRemoteTags discovers all available version tags for <owner>/<repo> from
+// either $SCALES_GITHUB_MIRROR (when configured) or GitHub (via git ls-remote
+// and the GitHub REST API fallback), updating the local metadata index cache.
+pub fn FetchRemoteTags(owner: string, repo: string) -> (RepoIndexEntry, errors.Error) {
+    var tags []string
+
+    // 1. Check if a local mirror directory is configured via SCALES_GITHUB_MIRROR.
+    mirror := os.Getenv("SCALES_GITHUB_MIRROR")
+    if int64(mirror) != 0 && str.Len(mirror) > 0 {
+        mirrorRepoDir := JoinPath(JoinPath(NormalizePath(mirror), owner), repo)
+        if fs.IsDir(mirrorRepoDir) {
+            entries, err := fs.ReadDir(mirrorRepoDir)
+            if err.message == "" {
+                for i := 0; i < len(entries); i = i + 1 {
+                    if entries[i].IsDir && !str.StartsWith(entries[i].Name, ".") {
+                        tags = append(tags, entries[i].Name)
+                    }
+                }
+            }
+            // Also check if mirrorRepoDir is itself a git repository.
+            if len(tags) == 0 && fs.IsDir(JoinPath(mirrorRepoDir, ".git")) {
+                out, rc := os.ExecWithOutput([]string{"git", "ls-remote", "--tags", "--refs", mirrorRepoDir})
+                if rc == 0 {
+                    tags = parseGitLsRemoteTags(out)
+                }
+            }
+        }
+        if len(tags) == 0 {
+            return RepoIndexEntry{}, errors.New(str.Concat("no tags found in mirror for ", str.Concat(owner, str.Concat("/", repo))))
+        }
+        sorted := semver.SortTagsDesc(tags)
+        entry := RepoIndexEntry{
+            Owner:       owner,
+            Repo:        repo,
+            Latest:      sorted[0],
+            Tags:        sorted,
+            UpdatedUnix: time.Timestamp()
+        }
+        SaveRepoIndex(entry)
+        return entry, errors.New("")
+    }
+
+    // 2. Query GitHub using `git ls-remote --tags --refs`.
+    gitUrl := str.Concat("https://github.com/", str.Concat(owner, str.Concat("/", str.Concat(repo, ".git"))))
+    gitOut, gitRc := os.ExecWithOutput([]string{"git", "ls-remote", "--tags", "--refs", gitUrl})
+    if gitRc == 0 && str.Len(gitOut) > 0 {
+        tags = parseGitLsRemoteTags(gitOut)
+    }
+
+    // 3. Fallback: Query GitHub REST API (/repos/<owner>/<repo>/tags) via curl.
+    if len(tags) == 0 {
+        apiUrl := str.Concat("https://api.github.com/repos/", str.Concat(owner, str.Concat("/", str.Concat(repo, "/tags"))))
+        curlOut, curlRc := os.ExecWithOutput([]string{"curl", "-fsSL", "-H", "Accept: application/vnd.github+json", "-H", "User-Agent: scales-pkg-manager", apiUrl})
+        if curlRc == 0 && str.Len(curlOut) > 0 {
+            arrVal, jerr := json.Unmarshal(curlOut)
+            if jerr.message == "" {
+                n := json.ArrayLen(arrVal)
+                for i := 0; i < n; i = i + 1 {
+                    item := json.ArrayGet(arrVal, i)
+                    tname := json.GetString(item, "name")
+                    if str.Len(tname) > 0 {
+                        tags = append(tags, tname)
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. If the repository has no tags yet, check default branches (main/master).
+    if len(tags) == 0 {
+        headsOut, headsRc := os.ExecWithOutput([]string{"git", "ls-remote", "--heads", gitUrl})
+        if headsRc == 0 && str.Len(headsOut) > 0 {
+            if str.Contains(headsOut, "refs/heads/main") {
+                tags = append(tags, "main")
+            } else if str.Contains(headsOut, "refs/heads/master") {
+                tags = append(tags, "master")
+            }
+        }
+    }
+
+    if len(tags) == 0 {
+        return RepoIndexEntry{}, errors.New(str.Concat("unable to find any tags or branches on GitHub for ", str.Concat(owner, str.Concat("/", repo))))
+    }
+
+    sorted := semver.SortTagsDesc(tags)
+    entry := RepoIndexEntry{
+        Owner:       owner,
+        Repo:        repo,
+        Latest:      sorted[0],
+        Tags:        sorted,
+        UpdatedUnix: time.Timestamp()
+    }
+    SaveRepoIndex(entry)
+    return entry, errors.New("")
+}
+
+// ResolveVersion resolves a version constraint (such as "latest", "", "^1.0.0",
+// or "v1.0.2") for <owner>/<repo> using the local index cache and package cache,
+// contacting GitHub only when needed (unless forceRefresh is true).
+pub fn ResolveVersion(owner: string, repo: string, constraint: string, forceRefresh: bool, offline: bool) -> (string, errors.Error) {
+    c := str.Trim(constraint)
+    if str.Len(c) == 0 {
+        c = "latest"
+    }
+
+    // 1. Unless forceRefresh is requested, check local cached packages and local
+    //    metadata index cache first.
+    if !forceRefresh {
+        idx, ok := LoadRepoIndex(owner, repo)
+        if ok && len(idx.Tags) > 0 {
+            best := semver.ResolveBest(idx.Tags, c)
+            if str.Len(best) > 0 {
+                return best, errors.New("")
+            }
+        }
+        cachedVers := ListCachedVersions(owner, repo)
+        if len(cachedVers) > 0 {
+            bestCached := semver.ResolveBest(cachedVers, c)
+            if str.Len(bestCached) > 0 {
+                return bestCached, errors.New("")
+            }
+        }
+    }
+
+    if offline {
+        // In offline mode, fall back to any locally cached version or fail.
+        cachedVers := ListCachedVersions(owner, repo)
+        if len(cachedVers) > 0 {
+            bestCached := semver.ResolveBest(cachedVers, c)
+            if str.Len(bestCached) > 0 {
+                return bestCached, errors.New("")
+            }
+        }
+        return "", errors.New(str.Concat("cannot resolve ", str.Concat(owner, str.Concat("/", str.Concat(repo, str.Concat("@", str.Concat(c, " in offline mode (not in local cache)")))))))
+    }
+
+    // 2. Refresh the local index cache from remote (GitHub or mirror).
+    idx, ferr := FetchRemoteTags(owner, repo)
+    if ferr.message != "" {
+        // Fallback to local cache if network is unreachable.
+        cachedVers := ListCachedVersions(owner, repo)
+        if len(cachedVers) > 0 {
+            bestCached := semver.ResolveBest(cachedVers, c)
+            if str.Len(bestCached) > 0 {
+                return bestCached, errors.New("")
+            }
+        }
+        return "", ferr
+    }
+
+    best := semver.ResolveBest(idx.Tags, c)
+    if str.Len(best) == 0 {
+        return "", errors.New(str.Concat("no version of ", str.Concat(owner, str.Concat("/", str.Concat(repo, str.Concat(" matches constraint \"", str.Concat(c, "\"")))))))
+    }
+    return best, errors.New("")
+}
+
+// isPackagePopulated checks whether an extracted package directory exists and
+// contains at least one file.
+pub fn IsPackageCached(owner: string, repo: string, version: string) -> bool {
+    pkgDir := PackageCacheDir(owner, repo, version)
+    if !fs.IsDir(pkgDir) {
+        return false
+    }
+    entries, err := fs.ReadDir(pkgDir)
+    if err.message != "" {
+        return false
+    }
+    return len(entries) > 0
+}
+
+// FetchPackage ensures that <owner>/<repo>@<version> is downloaded and unpacked
+// in the local cache (<cache_root>/packages/<owner>/<repo>/<version>/).
+// If the package is already cached, it returns immediately without network I/O.
+pub fn FetchPackage(owner: string, repo: string, version: string, offline: bool) -> (CachedPackage, errors.Error) {
+    err := EnsureCacheDirs()
+    if err.message != "" {
+        return CachedPackage{}, err
+    }
+
+    key := str.Concat("mod/", str.Concat(owner, str.Concat("/", repo)))
+    installDir := PackageCacheDir(owner, repo, version)
+    archivePath := ArchiveCachePath(owner, repo, version)
+
+    // 1. Check local package cache first (APT/DNF style cache hit).
+    if IsPackageCached(owner, repo, version) {
+        sha, src := readPackageMeta(installDir)
+        if str.Len(sha) == 0 {
+            sha = ComputePackageHash(installDir)
+        }
+        if str.Len(src) == 0 {
+            src = str.Concat("https://github.com/", str.Concat(owner, str.Concat("/", repo)))
+        }
+        return CachedPackage{
+            Key:        key,
+            Owner:      owner,
+            Repo:       repo,
+            Version:    version,
+            InstallDir: installDir,
+            Archive:    archivePath,
+            Sha256:     sha,
+            Source:     src,
+            FromCache:  true
+        }, errors.New("")
+    }
+
+    if offline {
+        return CachedPackage{}, errors.New(str.Concat("package ", str.Concat(key, str.Concat("@", str.Concat(version, " is not in the local cache (--offline)")))))
+    }
+
+    // 2. Check SCALES_GITHUB_MIRROR if set.
+    mirror := os.Getenv("SCALES_GITHUB_MIRROR")
+    if int64(mirror) != 0 && str.Len(mirror) > 0 {
+        mirrorVerDir := JoinPath(JoinPath(JoinPath(NormalizePath(mirror), owner), repo), version)
+        if fs.IsDir(mirrorVerDir) {
+            cerr := copyDirRecursive(mirrorVerDir, installDir)
+            if cerr.message != "" {
+                return CachedPackage{}, cerr
+            }
+            sha := ComputePackageHash(installDir)
+            src := str.Concat("mirror://", str.Concat(owner, str.Concat("/", str.Concat(repo, str.Concat("@", version)))))
+            writePackageMeta(installDir, owner, repo, version, sha, src)
+            updateCachedRepoIndex(owner, repo, version)
+            return CachedPackage{
+                Key:        key,
+                Owner:      owner,
+                Repo:       repo,
+                Version:    version,
+                InstallDir: installDir,
+                Archive:    archivePath,
+                Sha256:     sha,
+                Source:     src,
+                FromCache:  false
+            }, errors.New("")
+        }
+    }
+
+    // 3. Download release/tag tarball from GitHub into <cache_root>/archives/
+    //    and extract into <cache_root>/packages/<owner>/<repo>/<version>/.
+    tagTarUrl := str.Concat("https://github.com/", str.Concat(owner, str.Concat("/", str.Concat(repo, str.Concat("/archive/refs/tags/", str.Concat(version, ".tar.gz"))))))
+    headTarUrl := str.Concat("https://github.com/", str.Concat(owner, str.Concat("/", str.Concat(repo, str.Concat("/archive/refs/heads/", str.Concat(version, ".tar.gz"))))))
+    sourceUrl := str.Concat("https://github.com/", str.Concat(owner, str.Concat("/", str.Concat(repo, str.Concat("@", version)))))
+
+    downloaded := false
+    if fs.IsFile(archivePath) && fs.FileSize(archivePath) > int64(0) {
+        downloaded = true
+    } else {
+        _, rc := os.ExecWithOutput([]string{"curl", "-fsSL", "-o", archivePath, tagTarUrl})
+        if rc == 0 && fs.IsFile(archivePath) && fs.FileSize(archivePath) > int64(0) {
+            downloaded = true
+        } else {
+            // Try branch tarball URL (e.g. main/master).
+            _, rc2 := os.ExecWithOutput([]string{"curl", "-fsSL", "-o", archivePath, headTarUrl})
+            if rc2 == 0 && fs.IsFile(archivePath) && fs.FileSize(archivePath) > int64(0) {
+                downloaded = true
+            }
+        }
+    }
+
+    if downloaded {
+        err = MkdirAll(installDir)
+        if err.message != "" {
+            return CachedPackage{}, err
+        }
+        // Extract tarball stripping the top-level "<repo>-<tag>/" directory.
+        _, trc := os.ExecWithOutput([]string{"tar", "-xzf", archivePath, "-C", installDir, "--strip-components=1"})
+        if trc == 0 && IsPackageCached(owner, repo, version) {
+            sha := ComputePackageHash(installDir)
+            writePackageMeta(installDir, owner, repo, version, sha, sourceUrl)
+            updateCachedRepoIndex(owner, repo, version)
+            return CachedPackage{
+                Key:        key,
+                Owner:      owner,
+                Repo:       repo,
+                Version:    version,
+                InstallDir: installDir,
+                Archive:    archivePath,
+                Sha256:     sha,
+                Source:     sourceUrl,
+                FromCache:  false
+            }, errors.New("")
+        }
+    }
+
+    // 4. Fallback: shallow git clone for the requested tag/branch.
+    gitUrl := str.Concat("https://github.com/", str.Concat(owner, str.Concat("/", str.Concat(repo, ".git"))))
+    err = MkdirAll(RepoPackagesDir(owner, repo))
+    if err.message != "" {
+        return CachedPackage{}, err
+    }
+    _, grc := os.ExecWithOutput([]string{"git", "clone", "--depth", "1", "--branch", version, gitUrl, installDir})
+    if grc == 0 && IsPackageCached(owner, repo, version) {
+        RemoveDirRecursive(JoinPath(installDir, ".git"))
+        sha := ComputePackageHash(installDir)
+        writePackageMeta(installDir, owner, repo, version, sha, sourceUrl)
+        updateCachedRepoIndex(owner, repo, version)
+        return CachedPackage{
+            Key:        key,
+            Owner:      owner,
+            Repo:       repo,
+            Version:    version,
+            InstallDir: installDir,
+            Archive:    archivePath,
+            Sha256:     sha,
+            Source:     sourceUrl,
+            FromCache:  false
+        }, errors.New("")
+    }
+
+    return CachedPackage{}, errors.New(str.Concat("failed to fetch ", str.Concat(key, str.Concat("@", str.Concat(version, " from GitHub")))))
+}
+
+// updateCachedRepoIndex ensures that a newly fetched version is recorded in the
+// local metadata index cache for <owner>/<repo>.
+fn updateCachedRepoIndex(owner: string, repo: string, version: string) {
+    idx, ok := LoadRepoIndex(owner, repo)
+    var tags []string
+    found := false
+    if ok {
+        for i := 0; i < len(idx.Tags); i = i + 1 {
+            tags = append(tags, idx.Tags[i])
+            if str.Equal(idx.Tags[i], version) {
+                found = true
+            }
+        }
+    }
+    if !found {
+        tags = append(tags, version)
+    }
+    sorted := semver.SortTagsDesc(tags)
+    latest := version
+    if len(sorted) > 0 {
+        latest = sorted[0]
+    }
+    SaveRepoIndex(RepoIndexEntry{
+        Owner:       owner,
+        Repo:        repo,
+        Latest:      latest,
+        Tags:        sorted,
+        UpdatedUnix: time.Timestamp()
+    })
+}
+
+// ResolveModuleFile resolves a Skink source import path of the form
+// "mod/<owner>/<repo>[@version][/<subpath>]" to the physical .skink file path
+// in the local scales cache, consulting skink.lock and skink.toml in
+// projectDir when @version is omitted.
+pub fn ResolveModuleFile(importPath: string, projectDir: string) -> (string, errors.Error) {
+    spec := modres.ParseSpec(importPath, true)
+    if !spec.Valid {
+        return "", errors.New(spec.Error)
+    }
+
+    constraint := spec.Version
+    // If @version was omitted in the import statement, check skink.lock and
+    // skink.toml in projectDir (walking up parent directories if needed).
+    if str.Len(constraint) == 0 && str.Len(projectDir) > 0 {
+        lock := manifest.LoadLockfile(projectDir)
+        lockedPkg, foundLock := manifest.FindLockedPackage(lock, spec.CanonicalKey)
+        if foundLock && str.Len(lockedPkg.Version) > 0 {
+            constraint = lockedPkg.Version
+        } else {
+            m, _, merr := manifest.LoadFromDir(projectDir)
+            if merr.message == "" {
+                dep, foundDep := manifest.FindDependency(m, spec.Owner, spec.Repo)
+                if foundDep && str.Len(dep.Constraint) > 0 {
+                    constraint = dep.Constraint
+                }
+            }
+        }
+    }
+    if str.Len(constraint) == 0 {
+        constraint = "latest"
+    }
+
+    // Resolve against cached versions first.
+    cachedVers := ListCachedVersions(spec.Owner, spec.Repo)
+    resolvedVer := ""
+    if len(cachedVers) > 0 {
+        resolvedVer = semver.ResolveBest(cachedVers, constraint)
+    }
+    if str.Len(resolvedVer) == 0 {
+        var rerr errors.Error
+        resolvedVer, rerr = ResolveVersion(spec.Owner, spec.Repo, constraint, false, false)
+        if rerr.message != "" {
+            return "", rerr
+        }
+    }
+
+    if !IsPackageCached(spec.Owner, spec.Repo, resolvedVer) {
+        _, ferr := FetchPackage(spec.Owner, spec.Repo, resolvedVer, false)
+        if ferr.message != "" {
+            return "", ferr
+        }
+    }
+
+    pkgDir := PackageCacheDir(spec.Owner, spec.Repo, resolvedVer)
+    manifestEntry := ""
+    pkgManifest, _, pmErr := manifest.LoadFromDir(pkgDir)
+    if pmErr.message == "" {
+        manifestEntry = pkgManifest.Package.Entry
+    }
+    entryFile := modres.ResolveEntryFile(pkgDir, spec.Repo, spec.Subpath, manifestEntry)
+    if str.Len(entryFile) == 0 {
+        return "", errors.New(str.Concat("no .skink module entry file found in ", pkgDir))
+    }
+    return entryFile, errors.New("")
+}
+

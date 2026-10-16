@@ -1,0 +1,14 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: Scales — Official package manager and module resolution system
+//          for the Skink programming language.
+//
+// File:    version.skink
+// Purpose: Exports the current version string of the scales CLI tool.
+// Author:  Mark Oxley
+// Created: 2026
+
+module version
+
+// Version is the semantic version of scales.
+pub const Version = "0.1.0"

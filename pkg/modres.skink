@@ -1,0 +1,286 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: Scales — Official package manager and module resolution system
+//          for the Skink programming language.
+//
+// File:    pkg/modres.skink
+// Purpose: Parses and validates module import paths of the form
+//          "mod/<github_owner>/<repo_name>[@version][/<subpath>]" and
+//          locates the backing Skink source file inside a package directory.
+// Author:  Mark Oxley
+// Created: 2026
+
+module modres
+
+import "std/str"
+import "std/fs"
+
+// ModuleSpec holds the decomposed components of a Skink third-party module
+// specifier such as "mod/markoxley/skink-orm@v1.0.2".
+pub struct ModuleSpec {
+    CanonicalKey: string // Canonical module key: "mod/<owner>/<repo>"
+    Owner:        string // GitHub owner / organization name
+    Repo:         string // GitHub repository name
+    Version:      string // Optional version/constraint after '@' ("" if omitted)
+    Subpath:      string // Optional sub-package path inside the repository
+    Valid:        bool   // Whether the specifier is well-formed
+    Error:        string // Validation error message when Valid is false
+}
+
+// isSafeIdentChar reports whether byte c is allowed in a GitHub owner or
+// repository identifier ([A-Za-z0-9._-]).
+fn isSafeIdentChar(c: int) -> bool {
+    if c >= 48 && c <= 57 {
+        return true // 0-9
+    }
+    if c >= 65 && c <= 90 {
+        return true // A-Z
+    }
+    if c >= 97 && c <= 122 {
+        return true // a-z
+    }
+    return c == 45 || c == 95 || c == 46 // '-', '_', '.'
+}
+
+// isSafeIdentifier validates that s is a non-empty, safe path segment without
+// ".." traversal or shell metacharacters.
+pub fn IsSafeIdentifier(s: string) -> bool {
+    n := str.Len(s)
+    if n == 0 || str.Equal(s, ".") || str.Equal(s, "..") {
+        return false
+    }
+    for i := 0; i < n; i = i + 1 {
+        if !isSafeIdentChar(int(s[i])) {
+            return false
+        }
+    }
+    return true
+}
+
+// IsModImport reports whether an import string uses the third-party module
+// prefix "mod/".
+pub fn IsModImport(importPath: string) -> bool {
+    return str.StartsWith(str.Trim(importPath), "mod/")
+}
+
+// ParseSpec parses a module specifier from either source code
+// ("mod/<owner>/<repo>[@version][/<subpath>]") or CLI arguments
+// (which also accept "<owner>/<repo>[@version]" without the leading "mod/").
+pub fn ParseSpec(raw: string, requireModPrefix: bool) -> ModuleSpec {
+    s := str.Trim(raw)
+    // Normalize Windows backslashes if present.
+    s = str.Replace(s, "\\", "/")
+    if str.StartsWith(s, "mod/") {
+        s = str.Substr(s, 4, str.Len(s) - 4)
+    } else if requireModPrefix {
+        return ModuleSpec{
+            CanonicalKey: "",
+            Owner:        "",
+            Repo:         "",
+            Version:      "",
+            Subpath:      "",
+            Valid:        false,
+            Error:        "module import must start with \"mod/<owner>/<repo>\""
+        }
+    }
+
+    parts := str.Split(s, "/")
+    if len(parts) < 2 {
+        return ModuleSpec{
+            CanonicalKey: "",
+            Owner:        "",
+            Repo:         "",
+            Version:      "",
+            Subpath:      "",
+            Valid:        false,
+            Error:        "expected format \"mod/<github_owner>/<repo_name>[@version]\""
+        }
+    }
+
+    owner := parts[0]
+    repoAndVer := parts[1]
+    version := ""
+    repo := repoAndVer
+
+    // Extract @version from the repo segment if present.
+    atIdx := str.IndexOf(repoAndVer, "@")
+    if atIdx >= 0 {
+        repo = str.Substr(repoAndVer, 0, atIdx)
+        version = str.Substr(repoAndVer, atIdx + 1, str.Len(repoAndVer) - atIdx - 1)
+        if str.Len(version) == 0 {
+            return ModuleSpec{
+                CanonicalKey: "",
+                Owner:        owner,
+                Repo:         repo,
+                Version:      "",
+                Subpath:      "",
+                Valid:        false,
+                Error:        "empty version after '@' in module specifier"
+            }
+        }
+    }
+
+    // Collect any remaining segments as a subpath; also support @version on
+    // the final segment (e.g. "mod/owner/repo/sub@v1.0.0").
+    var subParts []string
+    for i := 2; i < len(parts); i = i + 1 {
+        seg := parts[i]
+        if i == len(parts) - 1 && str.Len(version) == 0 {
+            segAt := str.IndexOf(seg, "@")
+            if segAt >= 0 {
+                version = str.Substr(seg, segAt + 1, str.Len(seg) - segAt - 1)
+                seg = str.Substr(seg, 0, segAt)
+            }
+        }
+        if str.Len(seg) > 0 {
+            if !IsSafeIdentifier(seg) {
+                return ModuleSpec{
+                    CanonicalKey: "",
+                    Owner:        owner,
+                    Repo:         repo,
+                    Version:      version,
+                    Subpath:      "",
+                    Valid:        false,
+                    Error:        str.Concat("invalid subpath segment: ", seg)
+                }
+            }
+            subParts = append(subParts, seg)
+        }
+    }
+    subpath := str.Join(subParts, "/")
+
+    if !IsSafeIdentifier(owner) {
+        return ModuleSpec{
+            CanonicalKey: "",
+            Owner:        owner,
+            Repo:         repo,
+            Version:      version,
+            Subpath:      subpath,
+            Valid:        false,
+            Error:        str.Concat("invalid GitHub owner name: ", owner)
+        }
+    }
+    if !IsSafeIdentifier(repo) {
+        return ModuleSpec{
+            CanonicalKey: "",
+            Owner:        owner,
+            Repo:         repo,
+            Version:      version,
+            Subpath:      subpath,
+            Valid:        false,
+            Error:        str.Concat("invalid repository name: ", repo)
+        }
+    }
+
+    canonical := str.Concat("mod/", str.Concat(owner, str.Concat("/", repo)))
+    return ModuleSpec{
+        CanonicalKey: canonical,
+        Owner:        owner,
+        Repo:         repo,
+        Version:      version,
+        Subpath:      subpath,
+        Valid:        true,
+        Error:        ""
+    }
+}
+
+// SanitizeModuleName converts a repository name (such as "skink-orm") into a
+// valid Skink module identifier ("skink_orm").
+pub fn SanitizeModuleName(repo: string) -> string {
+    s := str.Replace(repo, "-", "_")
+    s = str.Replace(s, ".", "_")
+    if str.StartsWith(s, "skink_") && str.Len(s) > 6 {
+        return s
+    }
+    return s
+}
+
+// joinCross joins two path segments using '/' for cross-platform consistency.
+fn joinCross(a: string, b: string) -> string {
+    if str.Len(a) == 0 {
+        return b
+    }
+    if str.EndsWith(a, "/") || str.EndsWith(a, "\\") {
+        return str.Concat(a, b)
+    }
+    return str.Concat(a, str.Concat("/", b))
+}
+
+// ResolveEntryFile locates the primary .skink source file inside an extracted
+// package directory (and optional subpath).
+pub fn ResolveEntryFile(pkgDir: string, repo: string, subpath: string, manifestEntry: string) -> string {
+    targetDir := pkgDir
+    if str.Len(subpath) > 0 {
+        // Direct file match for subpath.skink
+        directFile := joinCross(pkgDir, str.Concat(subpath, ".skink"))
+        if fs.IsFile(directFile) {
+            return directFile
+        }
+        targetDir = joinCross(pkgDir, subpath)
+    } else if str.Len(manifestEntry) > 0 {
+        entryCandidate := joinCross(pkgDir, manifestEntry)
+        if fs.IsFile(entryCandidate) {
+            return entryCandidate
+        }
+    }
+
+    // 1. Check <repo>.skink (e.g. skink-orm.skink)
+    c1 := joinCross(targetDir, str.Concat(repo, ".skink"))
+    if fs.IsFile(c1) {
+        return c1
+    }
+    // 2. Check sanitized <repo_underscore>.skink (e.g. skink_orm.skink)
+    sanitized := SanitizeModuleName(repo)
+    c2 := joinCross(targetDir, str.Concat(sanitized, ".skink"))
+    if fs.IsFile(c2) {
+        return c2
+    }
+    // 3. If repo starts with "skink-", check stripped name (e.g. orm.skink)
+    if str.StartsWith(repo, "skink-") && str.Len(repo) > 6 {
+        shortName := str.Substr(repo, 6, str.Len(repo) - 6)
+        c3 := joinCross(targetDir, str.Concat(shortName, ".skink"))
+        if fs.IsFile(c3) {
+            return c3
+        }
+    }
+    // 4. Check lib.skink or main.skink
+    c4 := joinCross(targetDir, "lib.skink")
+    if fs.IsFile(c4) {
+        return c4
+    }
+    c5 := joinCross(targetDir, "main.skink")
+    if fs.IsFile(c5) {
+        return c5
+    }
+    // 5. Check src/<repo>.skink, src/lib.skink, src/main.skink
+    srcDir := joinCross(targetDir, "src")
+    if fs.IsDir(srcDir) {
+        s1 := joinCross(srcDir, str.Concat(repo, ".skink"))
+        if fs.IsFile(s1) {
+            return s1
+        }
+        s2 := joinCross(srcDir, str.Concat(sanitized, ".skink"))
+        if fs.IsFile(s2) {
+            return s2
+        }
+        s3 := joinCross(srcDir, "lib.skink")
+        if fs.IsFile(s3) {
+            return s3
+        }
+        s4 := joinCross(srcDir, "main.skink")
+        if fs.IsFile(s4) {
+            return s4
+        }
+    }
+    // 6. Fallback: scan targetDir for the first non-test .skink file
+    entries, err := fs.ReadDir(targetDir)
+    if err.message == "" {
+        for i := 0; i < len(entries); i = i + 1 {
+            name := entries[i].Name
+            if !entries[i].IsDir && str.EndsWith(name, ".skink") && !str.EndsWith(name, "_test.skink") {
+                return joinCross(targetDir, name)
+            }
+        }
+    }
+    return ""
+}

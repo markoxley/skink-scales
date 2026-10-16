@@ -1,0 +1,266 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: Scales — Official package manager and module resolution system
+//          for the Skink programming language.
+//
+// File:    pkg/semver.skink
+// Purpose: Semantic version parsing, comparison, sorting, and version
+//          constraint evaluation (exact, caret ^, tilde ~, range operators,
+//          wildcards, and latest).
+// Author:  Mark Oxley
+// Created: 2026
+
+module semver
+
+import "std/str"
+import "std/strconv"
+
+// SemVer represents a parsed semantic version (vMAJOR.MINOR.PATCH[-PRERELEASE]).
+pub struct SemVer {
+    Raw:        string // Original tag string (e.g. "v1.0.2")
+    Major:      int    // Major version number
+    Minor:      int    // Minor version number
+    Patch:      int    // Patch version number
+    PreRelease: string // Optional pre-release suffix (e.g. "alpha.1")
+    Valid:      bool   // Whether the version parsed as valid semver
+}
+
+// Parse parses a version string such as "v1.0.2", "1.2.0-beta.1", or "v0.3"
+// into a SemVer struct.
+pub fn Parse(raw: string) -> SemVer {
+    trimmed := str.Trim(raw)
+    if str.Len(trimmed) == 0 {
+        return SemVer{Raw: raw, Major: 0, Minor: 0, Patch: 0, PreRelease: "", Valid: false}
+    }
+    clean := trimmed
+    if str.StartsWith(clean, "v") || str.StartsWith(clean, "V") {
+        clean = str.Substr(clean, 1, str.Len(clean) - 1)
+    }
+    // Strip build metadata (+...) if present.
+    plusIdx := str.IndexOf(clean, "+")
+    if plusIdx >= 0 {
+        clean = str.Substr(clean, 0, plusIdx)
+    }
+    // Extract pre-release (-...) if present.
+    pre := ""
+    dashIdx := str.IndexOf(clean, "-")
+    if dashIdx >= 0 {
+        pre = str.Substr(clean, dashIdx + 1, str.Len(clean) - dashIdx - 1)
+        clean = str.Substr(clean, 0, dashIdx)
+    }
+    parts := str.Split(clean, ".")
+    if len(parts) < 1 || len(parts) > 3 {
+        return SemVer{Raw: trimmed, Major: 0, Minor: 0, Patch: 0, PreRelease: pre, Valid: false}
+    }
+    maj, ok1 := strconv.ParseInt(parts[0])
+    if !ok1 || maj < 0 {
+        return SemVer{Raw: trimmed, Major: 0, Minor: 0, Patch: 0, PreRelease: pre, Valid: false}
+    }
+    min := 0
+    if len(parts) >= 2 {
+        var ok2 bool
+        min, ok2 = strconv.ParseInt(parts[1])
+        if !ok2 || min < 0 {
+            return SemVer{Raw: trimmed, Major: 0, Minor: 0, Patch: 0, PreRelease: pre, Valid: false}
+        }
+    }
+    pat := 0
+    if len(parts) == 3 {
+        var ok3 bool
+        pat, ok3 = strconv.ParseInt(parts[2])
+        if !ok3 || pat < 0 {
+            return SemVer{Raw: trimmed, Major: 0, Minor: 0, Patch: 0, PreRelease: pre, Valid: false}
+        }
+    }
+    return SemVer{
+        Raw:        trimmed,
+        Major:      maj,
+        Minor:      min,
+        Patch:      pat,
+        PreRelease: pre,
+        Valid:      true
+    }
+}
+
+// NormalizeTag returns a canonical "vMAJOR.MINOR.PATCH" string if raw is a
+// valid version, preserving the leading "v" convention used by Skink modules.
+pub fn NormalizeTag(raw: string) -> string {
+    v := Parse(raw)
+    if !v.Valid {
+        return str.Trim(raw)
+    }
+    base := str.Concat("v", str.Concat(strconv.Itoa(v.Major), str.Concat(".", str.Concat(strconv.Itoa(v.Minor), str.Concat(".", strconv.Itoa(v.Patch))))))
+    if str.Len(v.PreRelease) > 0 {
+        return str.Concat(base, str.Concat("-", v.PreRelease))
+    }
+    return base
+}
+
+// Compare compares two SemVer structs according to Semantic Versioning 2.0.0.
+// Returns -1 if a < b, 0 if a == b, and 1 if a > b.
+pub fn Compare(a: SemVer, b: SemVer) -> int {
+    if a.Valid && !b.Valid {
+        return 1
+    }
+    if !a.Valid && b.Valid {
+        return -1
+    }
+    if !a.Valid && !b.Valid {
+        return str.Compare(a.Raw, b.Raw)
+    }
+    if a.Major != b.Major {
+        if a.Major < b.Major {
+            return -1
+        }
+        return 1
+    }
+    if a.Minor != b.Minor {
+        if a.Minor < b.Minor {
+            return -1
+        }
+        return 1
+    }
+    if a.Patch != b.Patch {
+        if a.Patch < b.Patch {
+            return -1
+        }
+        return 1
+    }
+    // A normal release has higher precedence than a pre-release version.
+    aEmpty := str.Len(a.PreRelease) == 0
+    bEmpty := str.Len(b.PreRelease) == 0
+    if aEmpty && bEmpty {
+        return 0
+    }
+    if aEmpty && !bEmpty {
+        return 1
+    }
+    if !aEmpty && bEmpty {
+        return -1
+    }
+    return str.Compare(a.PreRelease, b.PreRelease)
+}
+
+// CompareStrings compares two version strings using semantic version ordering.
+pub fn CompareStrings(a: string, b: string) -> int {
+    return Compare(Parse(a), Parse(b))
+}
+
+// SortTagsDesc sorts a slice of version tag strings in descending order
+// (newest version first).
+pub fn SortTagsDesc(tags: []string) -> []string {
+    var out []string
+    for i := 0; i < len(tags); i = i + 1 {
+        out = append(out, tags[i])
+    }
+    n := len(out)
+    for i := 0; i < n; i = i + 1 {
+        for j := i + 1; j < n; j = j + 1 {
+            if CompareStrings(out[j], out[i]) > 0 {
+                tmp := out[i]
+                out[i] = out[j]
+                out[j] = tmp
+            }
+        }
+    }
+    return out
+}
+
+// matchesSingleConstraint checks a single atomic constraint (e.g. "^1.0.2",
+// "~1.2.0", ">=1.0.0", "<2.0.0", "v1.0.2", "*", "latest").
+fn matchesSingleConstraint(ver: SemVer, constraint: string) -> bool {
+    c := str.Trim(constraint)
+    if str.Len(c) == 0 || str.Equal(c, "*") || str.Equal(c, "latest") {
+        return true
+    }
+    if !ver.Valid {
+        return str.Equal(ver.Raw, c)
+    }
+    if str.StartsWith(c, "^") {
+        target := Parse(str.Substr(c, 1, str.Len(c) - 1))
+        if !target.Valid {
+            return false
+        }
+        if Compare(ver, target) < 0 {
+            return false
+        }
+        if target.Major > 0 {
+            return ver.Major == target.Major
+        }
+        if target.Minor > 0 {
+            return ver.Major == 0 && ver.Minor == target.Minor
+        }
+        return ver.Major == 0 && ver.Minor == 0 && ver.Patch == target.Patch
+    }
+    if str.StartsWith(c, "~") {
+        target := Parse(str.Substr(c, 1, str.Len(c) - 1))
+        if !target.Valid {
+            return false
+        }
+        if Compare(ver, target) < 0 {
+            return false
+        }
+        return ver.Major == target.Major && ver.Minor == target.Minor
+    }
+    if str.StartsWith(c, ">=") {
+        target := Parse(str.Substr(c, 2, str.Len(c) - 2))
+        return target.Valid && Compare(ver, target) >= 0
+    }
+    if str.StartsWith(c, "<=") {
+        target := Parse(str.Substr(c, 2, str.Len(c) - 2))
+        return target.Valid && Compare(ver, target) <= 0
+    }
+    if str.StartsWith(c, ">") {
+        target := Parse(str.Substr(c, 1, str.Len(c) - 1))
+        return target.Valid && Compare(ver, target) > 0
+    }
+    if str.StartsWith(c, "<") {
+        target := Parse(str.Substr(c, 1, str.Len(c) - 1))
+        return target.Valid && Compare(ver, target) < 0
+    }
+    if str.StartsWith(c, "=") {
+        target := Parse(str.Substr(c, 1, str.Len(c) - 1))
+        if !target.Valid {
+            return str.Equal(ver.Raw, str.Substr(c, 1, str.Len(c) - 1))
+        }
+        return Compare(ver, target) == 0
+    }
+    target := Parse(c)
+    if !target.Valid {
+        return str.Equal(ver.Raw, c)
+    }
+    return Compare(ver, target) == 0
+}
+
+// Matches reports whether candidate satisfies constraint.
+// Comma-separated compound constraints (e.g. ">=1.0.0, <2.0.0") are supported.
+pub fn Matches(candidate: string, constraint: string) -> bool {
+    c := str.Trim(constraint)
+    if str.Len(c) == 0 || str.Equal(c, "*") || str.Equal(c, "latest") {
+        return true
+    }
+    ver := Parse(candidate)
+    parts := str.Split(c, ",")
+    for i := 0; i < len(parts); i = i + 1 {
+        part := str.Trim(parts[i])
+        if str.Len(part) == 0 {
+            continue
+        }
+        if !matchesSingleConstraint(ver, part) {
+            return false
+        }
+    }
+    return true
+}
+
+// ResolveBest selects the highest version from availableTags that satisfies
+// constraint. Returns "" if no tag matches.
+pub fn ResolveBest(availableTags: []string, constraint: string) -> string {
+    sorted := SortTagsDesc(availableTags)
+    for i := 0; i < len(sorted); i = i + 1 {
+        if Matches(sorted[i], constraint) {
+            return sorted[i]
+        }
+    }
+    return ""
+}

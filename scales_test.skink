@@ -1,0 +1,202 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: Scales — Official package manager and module resolution system
+//          for the Skink programming language.
+//
+// File:    scales_test.skink
+// Purpose: Unit and end-to-end CLI integration tests for scales covering
+//          import syntax parsing, semver constraints, skink.toml/skink.lock
+//          manifests, target compatibility flags, APT/DNF-style local index
+//          and package caching, and CLI commands (init, add, install,
+//          restore, update, remove, list, resolve, cache).
+// Author:  Mark Oxley
+// Created: 2026
+
+module scales_test
+
+import "testing"
+import "std/fs"
+import "std/os"
+import "std/str"
+import "pkg/semver"
+import "pkg/modres"
+import "pkg/manifest"
+import "pkg/cache"
+
+// TestSemVerParseAndCompare verifies semantic version parsing, normalization,
+// and ordering (including pre-release precedence).
+pub fn TestSemVerParseAndCompare() {
+    v1 := semver.Parse("v1.0.2")
+    testing.AssertTrue(v1.Valid, "v1.0.2 should parse as valid semver")
+    testing.AssertEqualInt(1, v1.Major, "Major == 1")
+    testing.AssertEqualInt(0, v1.Minor, "Minor == 0")
+    testing.AssertEqualInt(2, v1.Patch, "Patch == 2")
+    testing.AssertEqualString("v1.0.2", semver.NormalizeTag("1.0.2"), "NormalizeTag adds leading v")
+
+    v2 := semver.Parse("v1.2.0")
+    testing.AssertTrue(semver.Compare(v2, v1) > 0, "v1.2.0 > v1.0.2")
+    testing.AssertTrue(semver.Compare(v1, v2) < 0, "v1.0.2 < v1.2.0")
+
+    vPre := semver.Parse("v1.2.0-alpha.1")
+    testing.AssertTrue(semver.Compare(v2, vPre) > 0, "release > pre-release")
+
+    sorted := semver.SortTagsDesc([]string{"v1.0.0", "v2.1.0", "v1.0.2", "v1.2.0"})
+    testing.AssertEqualString("v2.1.0", sorted[0], "highest version is v2.1.0")
+    testing.AssertEqualString("v1.2.0", sorted[1], "second version is v1.2.0")
+    testing.AssertEqualString("v1.0.2", sorted[2], "third version is v1.0.2")
+    testing.AssertEqualString("v1.0.0", sorted[3], "lowest version is v1.0.0")
+}
+
+// TestSemVerConstraints verifies exact, caret (^), tilde (~), range, wildcard,
+// and latest constraints, plus ResolveBest.
+pub fn TestSemVerConstraints() {
+    testing.AssertTrue(semver.Matches("v1.0.2", "v1.0.2"), "exact match with v")
+    testing.AssertTrue(semver.Matches("v1.0.2", "1.0.2"), "exact match without v")
+    testing.AssertTrue(semver.Matches("v1.4.0", "^1.0.2"), "caret matches minor upgrade")
+    testing.AssertFalse(semver.Matches("v2.0.0", "^1.0.2"), "caret rejects major upgrade")
+    testing.AssertTrue(semver.Matches("v1.0.9", "~1.0.2"), "tilde matches patch upgrade")
+    testing.AssertFalse(semver.Matches("v1.1.0", "~1.0.2"), "tilde rejects minor upgrade")
+    testing.AssertTrue(semver.Matches("v1.5.0", ">=1.2.0, <2.0.0"), "compound range match")
+    testing.AssertTrue(semver.Matches("v0.1.0", "latest"), "latest matches any valid version")
+    testing.AssertTrue(semver.Matches("v0.1.0", "*"), "wildcard matches any valid version")
+
+    tags := []string{"v1.0.0", "v1.0.2", "v1.3.1", "v2.0.0"}
+    testing.AssertEqualString("v1.3.1", semver.ResolveBest(tags, "^1.0.0"), "ResolveBest ^1.0.0 selects v1.3.1")
+    testing.AssertEqualString("v2.0.0", semver.ResolveBest(tags, "latest"), "ResolveBest latest selects v2.0.0")
+    testing.AssertEqualString("v1.0.2", semver.ResolveBest(tags, "v1.0.2"), "ResolveBest exact selects v1.0.2")
+}
+
+// TestModResParseSpec verifies parsing of `mod/<owner>/<repo>[@version]`
+// specifiers and Windows/Linux path normalization.
+pub fn TestModResParseSpec() {
+    s1 := modres.ParseSpec("mod/markoxley/skink-orm@v1.0.2", true)
+    testing.AssertTrue(s1.Valid, "mod/markoxley/skink-orm@v1.0.2 is valid")
+    testing.AssertEqualString("mod/markoxley/skink-orm", s1.CanonicalKey, "canonical key")
+    testing.AssertEqualString("markoxley", s1.Owner, "owner")
+    testing.AssertEqualString("skink-orm", s1.Repo, "repo")
+    testing.AssertEqualString("v1.0.2", s1.Version, "version")
+
+    s2 := modres.ParseSpec("mod/markoxley/skink-orm", true)
+    testing.AssertTrue(s2.Valid, "omitted @version is valid")
+    testing.AssertEqualString("", s2.Version, "empty version when omitted")
+
+    // Windows backslash normalization
+    sWin := modres.ParseSpec("mod\\markoxley\\skink-orm@v1.0.2", true)
+    testing.AssertTrue(sWin.Valid, "Windows backslash specifier is normalized")
+    testing.AssertEqualString("markoxley", sWin.Owner, "owner from Windows path")
+    testing.AssertEqualString("skink-orm", sWin.Repo, "repo from Windows path")
+
+    // Invalid specifier rejection
+    sBad := modres.ParseSpec("std/io", true)
+    testing.AssertFalse(sBad.Valid, "non-mod import rejected when requireModPrefix is true")
+}
+
+// TestManifestAndTargetCompatibility verifies skink.toml round-trip parsing,
+// skink.lock round-trip, and standard vs. bare-metal/no-std target validation.
+pub fn TestManifestAndTargetCompatibility() {
+    m := manifest.DefaultManifest("telemetry-node", "mark", true)
+    manifest.SetDependency(&m, "markoxley", "skink-hal", "^0.2.0", "no-std")
+    manifest.SetDependency(&m, "markoxley", "skink-orm", "v1.0.2", "any")
+
+    tomlText := manifest.FormatTOML(m)
+    parsed, err := manifest.ParseTOML(tomlText)
+    testing.AssertEqualString("", err.message, "ParseTOML succeeds without error")
+    testing.AssertEqualString("telemetry-node", parsed.Package.Name, "package name preserved")
+    testing.AssertTrue(parsed.Target.NoStd, "bare-metal no_std = true preserved")
+    testing.AssertEqualInt(2, len(parsed.Dependencies), "two dependencies preserved")
+
+    // Verify target compatibility check: bare-metal project rejects std-only dependency.
+    stdOnlyDep := manifest.TargetConfig{Env: "std-only", NoStd: false, OS: "linux", Arch: "x86_64"}
+    ok1, _ := manifest.CheckTargetCompatibility(parsed.Target, stdOnlyDep, "std")
+    testing.AssertFalse(ok1, "bare-metal project must reject explicit std-only dependency")
+
+    noStdDep := manifest.TargetConfig{Env: "no-std", NoStd: true, OS: "any", Arch: "any"}
+    ok2, _ := manifest.CheckTargetCompatibility(parsed.Target, noStdDep, "no-std")
+    testing.AssertTrue(ok2, "bare-metal project accepts no-std dependency")
+}
+
+// TestCacheAndEndToEndCLI verifies local index caching, offline package caching,
+// and the full scales CLI lifecycle (init, add, install/restore, update, list,
+// resolve).
+pub fn TestCacheAndEndToEndCLI() {
+    testBase := "/tmp/scales_e2e_test_suite"
+    cache.RemoveDirRecursive(testBase)
+
+    mirrorDir := cache.JoinPath(testBase, "mirror")
+    cacheDir := cache.JoinPath(testBase, "scales_cache")
+    projDir := cache.JoinPath(testBase, "my_app")
+
+    // Populate a local GitHub mirror with two versions of markoxley/skink-orm:
+    // v1.0.2 and v1.1.0.
+    v102 := cache.JoinPath(mirrorDir, "markoxley/skink-orm/v1.0.2")
+    v110 := cache.JoinPath(mirrorDir, "markoxley/skink-orm/v1.1.0")
+    cache.MkdirAll(v102)
+    cache.MkdirAll(v110)
+    cache.MkdirAll(projDir)
+
+    fs.WriteAll(cache.JoinPath(v102, "skink.toml"), "[package]\nname = \"skink-orm\"\nversion = \"1.0.2\"\nauthor = \"markoxley\"\nentry = \"orm.skink\"\n\n[target]\nenv = \"std\"\nno_std = false\n")
+    fs.WriteAll(cache.JoinPath(v102, "orm.skink"), "module orm\n\npub fn Connect() -> string {\n    return \"orm-v1.0.2\"\n}\n")
+
+    fs.WriteAll(cache.JoinPath(v110, "skink.toml"), "[package]\nname = \"skink-orm\"\nversion = \"1.1.0\"\nauthor = \"markoxley\"\nentry = \"orm.skink\"\n\n[target]\nenv = \"std\"\nno_std = false\n")
+    fs.WriteAll(cache.JoinPath(v110, "orm.skink"), "module orm\n\npub fn Connect() -> string {\n    return \"orm-v1.1.0\"\n}\n")
+
+    os.Setenv("SCALES_CACHE_DIR", cacheDir)
+    os.Setenv("SCALES_GITHUB_MIRROR", mirrorDir)
+
+    scalesBin := cache.JoinPath(os.Getwd(), "scales")
+    origCwd := os.Getwd()
+    os.Chdir(projDir)
+
+    // 1. scales init
+    _, rcInit := os.ExecWithOutput([]string{scalesBin, "init", "demo-app"})
+    testing.AssertEqualInt(0, rcInit, "scales init should exit 0")
+    testing.AssertTrue(fs.IsFile(cache.JoinPath(projDir, "skink.toml")), "skink.toml created by scales init")
+
+    // 2. scales add mod/markoxley/skink-orm@v1.0.2
+    _, rcAdd := os.ExecWithOutput([]string{scalesBin, "add", "mod/markoxley/skink-orm@v1.0.2"})
+    testing.AssertEqualInt(0, rcAdd, "scales add mod/markoxley/skink-orm@v1.0.2 should exit 0")
+    testing.AssertTrue(cache.IsPackageCached("markoxley", "skink-orm", "v1.0.2"), "v1.0.2 should be in local cache")
+    testing.AssertTrue(fs.IsFile(cache.GlobalIndexPath()), "global index.json created in local index cache")
+
+    // 3. scales restore --offline (verifies offline install from local cache without network/mirror)
+    os.Setenv("SCALES_GITHUB_MIRROR", "/nonexistent_mirror_path")
+    _, rcRestore := os.ExecWithOutput([]string{scalesBin, "restore", "--offline"})
+    testing.AssertEqualInt(0, rcRestore, "scales restore --offline should succeed from local cache")
+
+    // 4. scales resolve mod/markoxley/skink-orm@v1.0.2
+    resOut, rcRes := os.ExecWithOutput([]string{scalesBin, "resolve", "mod/markoxley/skink-orm@v1.0.2"})
+    testing.AssertEqualInt(0, rcRes, "scales resolve should exit 0")
+    testing.AssertTrue(str.Contains(resOut, "markoxley/skink-orm/v1.0.2/orm.skink"), "resolved path points to cached orm.skink")
+
+    // 5. scales update (re-enable mirror so v1.1.0 is discovered and applied)
+    os.Setenv("SCALES_GITHUB_MIRROR", mirrorDir)
+    _, rcUpdate := os.ExecWithOutput([]string{scalesBin, "update"})
+    testing.AssertEqualInt(0, rcUpdate, "scales update should exit 0")
+    testing.AssertTrue(cache.IsPackageCached("markoxley", "skink-orm", "v1.1.0"), "scales update should fetch and cache v1.1.0")
+
+    lock := manifest.LoadLockfile(projDir)
+    lockedPkg, foundLock := manifest.FindLockedPackage(lock, "mod/markoxley/skink-orm")
+    testing.AssertTrue(foundLock, "skink.lock should contain mod/markoxley/skink-orm")
+    testing.AssertEqualString("v1.1.0", lockedPkg.Version, "skink.lock should be updated to v1.1.0")
+
+    // 6. Compile and run a Skink source file using explicit @v1.0.2 import
+    explicitSrc := "module main\n\nimport \"mod/markoxley/skink-orm@v1.0.2\"\n\nfn main() -> int {\n    println(orm.Connect())\n    return 0\n}\n"
+    fs.WriteAll(cache.JoinPath(projDir, "app_explicit.skink"), explicitSrc)
+    _, rcBuild1 := os.ExecWithOutput([]string{"skink", "-o", cache.JoinPath(projDir, "app_explicit"), cache.JoinPath(projDir, "app_explicit.skink")})
+    testing.AssertEqualInt(0, rcBuild1, "skink should compile import \"mod/markoxley/skink-orm@v1.0.2\"")
+    runOut1, rcRun1 := os.ExecWithOutput([]string{cache.JoinPath(projDir, "app_explicit")})
+    testing.AssertEqualInt(0, rcRun1, "compiled app_explicit should exit 0")
+    testing.AssertEqualString("orm-v1.0.2", str.Trim(runOut1), "explicit @v1.0.2 binary prints orm-v1.0.2")
+
+    // 7. Compile and run a Skink source file omitting @version (resolves to v1.1.0)
+    latestSrc := "module main\n\nimport \"mod/markoxley/skink-orm\"\n\nfn main() -> int {\n    println(orm.Connect())\n    return 0\n}\n"
+    fs.WriteAll(cache.JoinPath(projDir, "app_latest.skink"), latestSrc)
+    _, rcBuild2 := os.ExecWithOutput([]string{"skink", "-o", cache.JoinPath(projDir, "app_latest"), cache.JoinPath(projDir, "app_latest.skink")})
+    testing.AssertEqualInt(0, rcBuild2, "skink should compile import \"mod/markoxley/skink-orm\"")
+    runOut2, rcRun2 := os.ExecWithOutput([]string{cache.JoinPath(projDir, "app_latest")})
+    testing.AssertEqualInt(0, rcRun2, "compiled app_latest should exit 0")
+    testing.AssertEqualString("orm-v1.1.0", str.Trim(runOut2), "omitted @version binary prints orm-v1.1.0")
+
+    os.Chdir(origCwd)
+    cache.RemoveDirRecursive(testBase)
+}

@@ -1,0 +1,625 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: Scales — Official package manager and module resolution system
+//          for the Skink programming language.
+//
+// File:    scales.skink
+// Purpose: Main CLI entry point for scales, implementing init, add,
+//          install/restore, update, remove, list, cache, and resolve commands.
+// Author:  Mark Oxley
+// Created: 2026
+
+module main
+
+import "std/os"
+import "std/fs"
+import "std/str"
+import "std/path"
+import "std/errors"
+import "version"
+import "pkg/semver"
+import "pkg/modres"
+import "pkg/manifest"
+import "pkg/cache"
+
+// printUsage prints the CLI usage and available commands for scales.
+fn printUsage() {
+    println("scales — Official package manager and module resolver for Skink")
+    println("")
+    println("Usage:")
+    println("  scales <command> [arguments] [flags]")
+    println("")
+    println("Commands:")
+    println("  init [name] [--no-std]            Initialize a new skink.toml manifest in the current directory")
+    println("  add <mod/owner/repo>[@version]    Add a dependency to skink.toml and fetch it into the local cache")
+    println("  install [--offline]               Resolve and fetch all dependencies from skink.toml into local cache")
+    println("  restore [--offline]               Alias for 'scales install'")
+    println("  update [mod/owner/repo]           Check for and apply dependency updates matching constraints")
+    println("  remove <mod/owner/repo>           Remove a dependency from skink.toml and skink.lock")
+    println("  list                              List project dependencies and their cached status")
+    println("  resolve <mod/owner/repo[@ver]>    Resolve a module import path to its cached .skink source file")
+    println("  cache <list|path|clean>           Inspect or manage the local APT/DNF-style package cache")
+    println("  version                           Print the scales version")
+    println("  help                              Show this help message")
+}
+
+// inferAuthor determines a sensible default author name from the environment.
+fn inferAuthor() -> string {
+    u := os.Getenv("USER")
+    if int64(u) != 0 && str.Len(u) > 0 {
+        return u
+    }
+    u2 := os.Getenv("USERNAME")
+    if int64(u2) != 0 && str.Len(u2) > 0 {
+        return u2
+    }
+    return "author"
+}
+
+// inferPackageName determines a default package name from the current working directory.
+fn inferPackageName(cwd: string) -> string {
+    norm := cache.NormalizePath(cwd)
+    base := path.Base(norm)
+    if str.Len(base) == 0 || str.Equal(base, ".") || str.Equal(base, "/") {
+        return "skink-app"
+    }
+    return base
+}
+
+// cmdInit handles `scales init [name] [--no-std | --bare-metal]`.
+fn cmdInit(args: []string) -> int {
+    cwd := os.Getwd()
+    if str.Len(cwd) == 0 {
+        cwd = "."
+    }
+    pkgName := ""
+    bareMetal := false
+    force := false
+
+    for i := 0; i < len(args); i = i + 1 {
+        arg := args[i]
+        if str.Equal(arg, "--no-std") || str.Equal(arg, "--bare-metal") || str.Equal(arg, "-no-std") {
+            bareMetal = true
+        } else if str.Equal(arg, "--force") || str.Equal(arg, "-f") {
+            force = true
+        } else if !str.StartsWith(arg, "-") && str.Len(pkgName) == 0 {
+            pkgName = arg
+        }
+    }
+
+    if str.Len(pkgName) == 0 {
+        pkgName = inferPackageName(cwd)
+    }
+
+    tomlPath := cache.JoinPath(cwd, "skink.toml")
+    if fs.Exists(tomlPath) && !force {
+        println("error: skink.toml already exists in this directory (use --force to overwrite)")
+        return 1
+    }
+
+    author := inferAuthor()
+    m := manifest.DefaultManifest(pkgName, author, bareMetal)
+    err := manifest.SaveTOML(cwd, m)
+    if err.message != "" {
+        println(str.Concat("error: failed to write skink.toml: ", err.message))
+        return 1
+    }
+
+    // Create a starter main.skink if none exists yet.
+    mainPath := cache.JoinPath(cwd, "main.skink")
+    if !fs.Exists(mainPath) {
+        starter := str.Concat("module main\n\nfn main() -> int {\n    println(\"Hello from ", str.Concat(pkgName, "!\")\n    return 0\n}\n"))
+        fs.WriteAll(mainPath, starter)
+    }
+
+    targetLabel := "std"
+    if bareMetal {
+        targetLabel = "bare-metal (no-std)"
+    }
+    println(str.Concat("Initialized Skink package '", str.Concat(pkgName, str.Concat("' (target: ", str.Concat(targetLabel, ") in skink.toml")))))
+    return 0
+}
+
+// installAndLockSingle resolves, downloads/caches, validates target compatibility,
+// and recursively installs transitive dependencies for a single dependency.
+fn installAndLockSingle(projectTarget: manifest.TargetConfig, dep: manifest.Dependency, lock: *manifest.Lockfile, forceRefresh: bool, offline: bool, visited: map[string]bool) -> (string, errors.Error) {
+    if visited[dep.Key] {
+        locked, ok := manifest.FindLockedPackage(*lock, dep.Key)
+        if ok {
+            return locked.Version, errors.New("")
+        }
+        return dep.Constraint, errors.New("")
+    }
+    visited[dep.Key] = true
+
+    constraint := dep.Constraint
+    if str.Len(constraint) == 0 {
+        constraint = "latest"
+    }
+
+    // If not force-refreshing, prefer the version already pinned in skink.lock
+    // when it still satisfies the manifest constraint.
+    resolvedVer := ""
+    if !forceRefresh {
+        locked, hasLock := manifest.FindLockedPackage(*lock, dep.Key)
+        if hasLock && str.Len(locked.Version) > 0 && semver.Matches(locked.Version, constraint) {
+            resolvedVer = locked.Version
+        }
+    }
+
+    if str.Len(resolvedVer) == 0 {
+        var rerr errors.Error
+        resolvedVer, rerr = cache.ResolveVersion(dep.Owner, dep.Repo, constraint, forceRefresh, offline)
+        if rerr.message != "" {
+            return "", rerr
+        }
+    }
+
+    cachedPkg, ferr := cache.FetchPackage(dep.Owner, dep.Repo, resolvedVer, offline)
+    if ferr.message != "" {
+        return "", ferr
+    }
+
+    // Check target compatibility if the fetched package has its own skink.toml.
+    depTargetEnv := dep.TargetEnv
+    if str.Len(depTargetEnv) == 0 {
+        depTargetEnv = "any"
+    }
+    depManifest, _, dmErr := manifest.LoadFromDir(cachedPkg.InstallDir)
+    if dmErr.message == "" {
+        okTarget, reason := manifest.CheckTargetCompatibility(projectTarget, depManifest.Target, depTargetEnv)
+        if !okTarget {
+            return "", errors.New(str.Concat("target incompatibility for ", str.Concat(dep.Key, str.Concat("@", str.Concat(resolvedVer, str.Concat(": ", reason))))))
+        }
+        if str.Len(depManifest.Target.Env) > 0 {
+            depTargetEnv = depManifest.Target.Env
+        }
+    } else {
+        okTarget, reason := manifest.CheckTargetCompatibility(projectTarget, manifest.TargetConfig{Env: "any", NoStd: false, OS: "any", Arch: "any"}, depTargetEnv)
+        if !okTarget {
+            return "", errors.New(str.Concat("target incompatibility for ", str.Concat(dep.Key, str.Concat("@", str.Concat(resolvedVer, str.Concat(": ", reason))))))
+        }
+    }
+
+    manifest.SetLockedPackage(lock, manifest.LockedPackage{
+        Key:       dep.Key,
+        Version:   resolvedVer,
+        Source:    cachedPkg.Source,
+        Sha256:    cachedPkg.Sha256,
+        TargetEnv: depTargetEnv
+    })
+
+    if cachedPkg.FromCache {
+        println(str.Concat("  [cached]  ", str.Concat(dep.Key, str.Concat("@", resolvedVer))))
+    } else {
+        println(str.Concat("  [fetched] ", str.Concat(dep.Key, str.Concat("@", resolvedVer))))
+    }
+
+    // Recursively resolve any transitive dependencies declared by this package.
+    if dmErr.message == "" && len(depManifest.Dependencies) > 0 {
+        for i := 0; i < len(depManifest.Dependencies); i = i + 1 {
+            subDep := depManifest.Dependencies[i]
+            _, terr := installAndLockSingle(projectTarget, subDep, lock, forceRefresh, offline, visited)
+            if terr.message != "" {
+                return "", terr
+            }
+        }
+    }
+
+    return resolvedVer, errors.New("")
+}
+
+// cmdAdd handles `scales add <mod/owner/repo>[@version] [--target <std|no-std>] [--offline]`.
+fn cmdAdd(args: []string) -> int {
+    cwd := os.Getwd()
+    if str.Len(cwd) == 0 {
+        cwd = "."
+    }
+
+    rawSpec := ""
+    targetEnv := "any"
+    offline := false
+
+    i := 0
+    for i < len(args) {
+        arg := args[i]
+        if str.Equal(arg, "--offline") {
+            offline = true
+        } else if str.Equal(arg, "--target") && i + 1 < len(args) {
+            i = i + 1
+            targetEnv = args[i]
+        } else if !str.StartsWith(arg, "-") && str.Len(rawSpec) == 0 {
+            rawSpec = arg
+        }
+        i = i + 1
+    }
+
+    if str.Len(rawSpec) == 0 {
+        println("error: missing module specifier (usage: scales add mod/<owner>/<repo>[@version])")
+        return 1
+    }
+
+    spec := modres.ParseSpec(rawSpec, false)
+    if !spec.Valid {
+        println(str.Concat("error: ", spec.Error))
+        return 1
+    }
+
+    // Load or initialize skink.toml in the current directory.
+    m, _, lerr := manifest.LoadFromDir(cwd)
+    if lerr.message != "" {
+        pkgName := inferPackageName(cwd)
+        m = manifest.DefaultManifest(pkgName, inferAuthor(), false)
+    }
+
+    constraint := spec.Version
+    if str.Len(constraint) == 0 {
+        constraint = "latest"
+    }
+
+    resolvedVer, rerr := cache.ResolveVersion(spec.Owner, spec.Repo, constraint, false, offline)
+    if rerr.message != "" {
+        println(str.Concat("error: ", rerr.message))
+        return 1
+    }
+
+    // If the user omitted @version, record the resolved version in skink.toml;
+    // otherwise preserve the user's explicit version or constraint.
+    manifestConstraint := spec.Version
+    if str.Len(manifestConstraint) == 0 {
+        manifestConstraint = resolvedVer
+    }
+
+    dep := manifest.Dependency{
+        Key:        spec.CanonicalKey,
+        Owner:      spec.Owner,
+        Repo:       spec.Repo,
+        Constraint: manifestConstraint,
+        TargetEnv:  targetEnv
+    }
+
+    lock := manifest.LoadLockfile(cwd)
+    visited := make(map[string]bool)
+    finalVer, ierr := installAndLockSingle(m.Target, dep, &lock, false, offline, visited)
+    if ierr.message != "" {
+        println(str.Concat("error: ", ierr.message))
+        return 1
+    }
+
+    manifest.SetDependency(&m, spec.Owner, spec.Repo, manifestConstraint, targetEnv)
+    serr := manifest.SaveTOML(cwd, m)
+    if serr.message != "" {
+        println(str.Concat("error: failed to save skink.toml: ", serr.message))
+        return 1
+    }
+    lserr := manifest.SaveLockfile(cwd, lock)
+    if lserr.message != "" {
+        println(str.Concat("error: failed to save skink.lock: ", lserr.message))
+        return 1
+    }
+
+    println(str.Concat("Added ", str.Concat(spec.CanonicalKey, str.Concat("@", str.Concat(finalVer, " to skink.toml")))))
+    return 0
+}
+
+// cmdInstall handles `scales install` and `scales restore`.
+fn cmdInstall(args: []string) -> int {
+    cwd := os.Getwd()
+    if str.Len(cwd) == 0 {
+        cwd = "."
+    }
+    offline := false
+    for i := 0; i < len(args); i = i + 1 {
+        if str.Equal(args[i], "--offline") {
+            offline = true
+        }
+    }
+
+    m, manifestPath, err := manifest.LoadFromDir(cwd)
+    if err.message != "" {
+        println(str.Concat("error: ", err.message))
+        return 1
+    }
+
+    if len(m.Dependencies) == 0 {
+        println(str.Concat("No dependencies declared in ", path.Base(manifestPath)))
+        return 0
+    }
+
+    println(str.Concat("Resolving and installing ", str.Concat(path.Base(manifestPath), " dependencies...")))
+    lock := manifest.LoadLockfile(cwd)
+    visited := make(map[string]bool)
+
+    for i := 0; i < len(m.Dependencies); i = i + 1 {
+        dep := m.Dependencies[i]
+        _, ierr := installAndLockSingle(m.Target, dep, &lock, false, offline, visited)
+        if ierr.message != "" {
+            println(str.Concat("error: ", ierr.message))
+            return 1
+        }
+    }
+
+    lerr := manifest.SaveLockfile(cwd, lock)
+    if lerr.message != "" {
+        println(str.Concat("error: failed to write skink.lock: ", lerr.message))
+        return 1
+    }
+    println("All dependencies installed and cached.")
+    return 0
+}
+
+// cmdUpdate handles `scales update [mod/owner/repo]`.
+fn cmdUpdate(args: []string) -> int {
+    cwd := os.Getwd()
+    if str.Len(cwd) == 0 {
+        cwd = "."
+    }
+    filterKey := ""
+    if len(args) > 0 && !str.StartsWith(args[0], "-") {
+        spec := modres.ParseSpec(args[0], false)
+        if !spec.Valid {
+            println(str.Concat("error: ", spec.Error))
+            return 1
+        }
+        filterKey = spec.CanonicalKey
+    }
+
+    m, _, err := manifest.LoadFromDir(cwd)
+    if err.message != "" {
+        println(str.Concat("error: ", err.message))
+        return 1
+    }
+
+    if len(m.Dependencies) == 0 {
+        println("No dependencies to update.")
+        return 0
+    }
+
+    lock := manifest.LoadLockfile(cwd)
+    visited := make(map[string]bool)
+    updatedCount := 0
+
+    for i := 0; i < len(m.Dependencies); i = i + 1 {
+        dep := m.Dependencies[i]
+        if str.Len(filterKey) > 0 && !str.Equal(dep.Key, filterKey) {
+            continue
+        }
+
+        prevLocked, hadPrev := manifest.FindLockedPackage(lock, dep.Key)
+        prevVer := ""
+        if hadPrev {
+            prevVer = prevLocked.Version
+        }
+
+        // Refresh the remote tag index for this dependency.
+        _, ferr := cache.FetchRemoteTags(dep.Owner, dep.Repo)
+        if ferr.message != "" {
+            println(str.Concat("warning: could not refresh remote index for ", str.Concat(dep.Key, str.Concat(": ", ferr.message))))
+        }
+
+        // If the manifest constraint is an exact version tag (not a range or "latest")
+        // and the user explicitly ran `scales update`, allow upgrading within the same
+        // major version (^<current>) or to latest when updating a specific package.
+        effectiveDep := dep
+        c := str.Trim(dep.Constraint)
+        isRange := str.StartsWith(c, "^") || str.StartsWith(c, "~") || str.StartsWith(c, ">") || str.StartsWith(c, "<") || str.Equal(c, "*") || str.Equal(c, "latest")
+        if !isRange {
+            effectiveDep.Constraint = str.Concat("^", c)
+        }
+
+        newVer, uerr := installAndLockSingle(m.Target, effectiveDep, &lock, true, false, visited)
+        if uerr.message != "" {
+            println(str.Concat("error updating ", str.Concat(dep.Key, str.Concat(": ", uerr.message))))
+            return 1
+        }
+
+        if !isRange && !str.Equal(newVer, dep.Constraint) {
+            m.Dependencies[i].Constraint = newVer
+        }
+
+        if !str.Equal(prevVer, newVer) {
+            updatedCount = updatedCount + 1
+            if str.Len(prevVer) > 0 {
+                println(str.Concat("  [updated] ", str.Concat(dep.Key, str.Concat(": ", str.Concat(prevVer, str.Concat(" -> ", newVer))))))
+            } else {
+                println(str.Concat("  [updated] ", str.Concat(dep.Key, str.Concat(" -> ", newVer))))
+            }
+        } else {
+            println(str.Concat("  [up-to-date] ", str.Concat(dep.Key, str.Concat("@", newVer))))
+        }
+    }
+
+    manifest.SaveTOML(cwd, m)
+    manifest.SaveLockfile(cwd, lock)
+
+    if updatedCount == 0 {
+        println("All dependencies are up to date.")
+    }
+    return 0
+}
+
+// cmdRemove handles `scales remove <mod/owner/repo>`.
+fn cmdRemove(args: []string) -> int {
+    if len(args) == 0 {
+        println("error: missing module specifier (usage: scales remove mod/<owner>/<repo>)")
+        return 1
+    }
+    spec := modres.ParseSpec(args[0], false)
+    if !spec.Valid {
+        println(str.Concat("error: ", spec.Error))
+        return 1
+    }
+    cwd := os.Getwd()
+    if str.Len(cwd) == 0 {
+        cwd = "."
+    }
+    m, _, err := manifest.LoadFromDir(cwd)
+    if err.message != "" {
+        println(str.Concat("error: ", err.message))
+        return 1
+    }
+    if !manifest.RemoveDependency(&m, spec.Owner, spec.Repo) {
+        println(str.Concat("error: dependency ", str.Concat(spec.CanonicalKey, " not found in skink.toml")))
+        return 1
+    }
+    manifest.SaveTOML(cwd, m)
+
+    lock := manifest.LoadLockfile(cwd)
+    var kept []manifest.LockedPackage
+    for i := 0; i < len(lock.Packages); i = i + 1 {
+        if !str.Equal(lock.Packages[i].Key, spec.CanonicalKey) {
+            kept = append(kept, lock.Packages[i])
+        }
+    }
+    lock.Packages = kept
+    manifest.SaveLockfile(cwd, lock)
+
+    println(str.Concat("Removed ", str.Concat(spec.CanonicalKey, " from skink.toml")))
+    return 0
+}
+
+// cmdList handles `scales list`.
+fn cmdList() -> int {
+    cwd := os.Getwd()
+    if str.Len(cwd) == 0 {
+        cwd = "."
+    }
+    m, _, err := manifest.LoadFromDir(cwd)
+    if err.message != "" {
+        println(str.Concat("error: ", err.message))
+        return 1
+    }
+    lock := manifest.LoadLockfile(cwd)
+    println(str.Concat(m.Package.Name, str.Concat(" v", str.Concat(m.Package.Version, str.Concat(" (target: ", str.Concat(m.Target.Env, ")"))))))
+    if len(m.Dependencies) == 0 {
+        println("  (no dependencies)")
+        return 0
+    }
+    for i := 0; i < len(m.Dependencies); i = i + 1 {
+        dep := m.Dependencies[i]
+        locked, hasLock := manifest.FindLockedPackage(lock, dep.Key)
+        resolved := dep.Constraint
+        if hasLock && str.Len(locked.Version) > 0 {
+            resolved = locked.Version
+        }
+        status := "missing"
+        if cache.IsPackageCached(dep.Owner, dep.Repo, resolved) {
+            status = "cached"
+        }
+        println(str.Concat("  - ", str.Concat(dep.Key, str.Concat(" (constraint: ", str.Concat(dep.Constraint, str.Concat(", resolved: ", str.Concat(resolved, str.Concat(", ", str.Concat(status, ")")))))))))
+    }
+    return 0
+}
+
+// cmdResolve handles `scales resolve <mod/owner/repo[@version]>`.
+fn cmdResolve(args: []string) -> int {
+    if len(args) == 0 {
+        println("error: missing import path (usage: scales resolve mod/<owner>/<repo>[@version])")
+        return 1
+    }
+    cwd := os.Getwd()
+    if str.Len(cwd) == 0 {
+        cwd = "."
+    }
+    imp := args[0]
+    if !str.StartsWith(imp, "mod/") {
+        imp = str.Concat("mod/", imp)
+    }
+    resolved, err := cache.ResolveModuleFile(imp, cwd)
+    if err.message != "" {
+        println(str.Concat("error: ", err.message))
+        return 1
+    }
+    println(resolved)
+    return 0
+}
+
+// cmdCache handles `scales cache [list|path|clean]`.
+fn cmdCache(args: []string) -> int {
+    sub := "list"
+    if len(args) > 0 {
+        sub = args[0]
+    }
+    if str.Equal(sub, "path") {
+        println(cache.GetCacheRoot())
+        return 0
+    }
+    if str.Equal(sub, "clean") {
+        root := cache.GetCacheRoot()
+        err := cache.RemoveDirRecursive(root)
+        if err.message != "" {
+            println(str.Concat("error cleaning cache: ", err.message))
+            return 1
+        }
+        cache.EnsureCacheDirs()
+        println(str.Concat("Cleaned scales cache at ", root))
+        return 0
+    }
+    if str.Equal(sub, "list") || str.Equal(sub, "ls") {
+        pkgs := cache.ListAllCachedPackages()
+        println(str.Concat("Cache root: ", cache.GetCacheRoot()))
+        if len(pkgs) == 0 {
+            println("  (cache is empty)")
+            return 0
+        }
+        for i := 0; i < len(pkgs); i = i + 1 {
+            p := pkgs[i]
+            println(str.Concat("  ", str.Concat(p.Key, str.Concat("@", str.Concat(p.Version, str.Concat(" -> ", p.InstallDir))))))
+        }
+        return 0
+    }
+    println(str.Concat("error: unknown cache subcommand: ", sub))
+    return 1
+}
+
+// main dispatches CLI arguments to the requested scales command.
+fn main() -> int {
+    args := os.Args()
+    if len(args) < 2 {
+        printUsage()
+        return 1
+    }
+
+    cmd := args[1]
+    var rest []string
+    for i := 2; i < len(args); i = i + 1 {
+        rest = append(rest, args[i])
+    }
+
+    if str.Equal(cmd, "-v") || str.Equal(cmd, "--version") || str.Equal(cmd, "version") {
+        println(str.Concat("scales ", version.Version))
+        return 0
+    }
+    if str.Equal(cmd, "-h") || str.Equal(cmd, "--help") || str.Equal(cmd, "help") {
+        printUsage()
+        return 0
+    }
+    if str.Equal(cmd, "init") {
+        return cmdInit(rest)
+    }
+    if str.Equal(cmd, "add") {
+        return cmdAdd(rest)
+    }
+    if str.Equal(cmd, "install") || str.Equal(cmd, "restore") {
+        return cmdInstall(rest)
+    }
+    if str.Equal(cmd, "update") {
+        return cmdUpdate(rest)
+    }
+    if str.Equal(cmd, "remove") || str.Equal(cmd, "rm") {
+        return cmdRemove(rest)
+    }
+    if str.Equal(cmd, "list") || str.Equal(cmd, "ls") {
+        return cmdList()
+    }
+    if str.Equal(cmd, "resolve") {
+        return cmdResolve(rest)
+    }
+    if str.Equal(cmd, "cache") {
+        return cmdCache(rest)
+    }
+
+    println(str.Concat("error: unknown command '", str.Concat(cmd, "'")))
+    printUsage()
+    return 1
+}

@@ -1,0 +1,587 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: Scales — Official package manager and module resolution system
+//          for the Skink programming language.
+//
+// File:    pkg/manifest.skink
+// Purpose: Parses, validates, and serializes Skink project manifests
+//          (skink.toml and skink.mod fallback) and lockfiles (skink.lock),
+//          including package metadata, version constraints, and target
+//          compatibility flags (standard vs. bare-metal/no-std).
+// Author:  Mark Oxley
+// Created: 2026
+
+module manifest
+
+import "std/str"
+import "std/fs"
+import "std/errors"
+import "pkg/modres"
+
+// PackageMeta holds the [package] metadata section of skink.toml.
+pub struct PackageMeta {
+    Name:        string // Package name
+    Version:     string // Package semantic version (e.g. "0.1.0")
+    Author:      string // Package author
+    Entry:       string // Entry source file (e.g. "main.skink")
+    Description: string // Optional package description
+    License:     string // Optional SPDX license identifier
+}
+
+// TargetConfig holds the [target] compatibility flags in skink.toml.
+pub struct TargetConfig {
+    Env:   string // Target environment: "std", "no-std", or "bare-metal"
+    NoStd: bool   // True when targeting freestanding / bare-metal environments
+    OS:    string // Target OS constraint: "any", "linux", "windows", "darwin", "none"
+    Arch:  string // Target architecture constraint: "any", "x86_64", "arm64", "riscv64"
+}
+
+// Dependency represents a single dependency entry in [dependencies].
+pub struct Dependency {
+    Key:        string // Canonical module path: "mod/<owner>/<repo>"
+    Owner:      string // GitHub owner
+    Repo:       string // GitHub repository name
+    Constraint: string // Version constraint (e.g. "v1.0.2", "^1.0.0", "latest")
+    TargetEnv:  string // Optional target compatibility override ("any", "std", "no-std")
+}
+
+// Manifest represents a complete parsed skink.toml (or skink.mod) project file.
+pub struct Manifest {
+    Package:      PackageMeta  // Package metadata
+    Target:       TargetConfig // Target environment and platform compatibility
+    Dependencies: []Dependency // Ordered list of project dependencies
+}
+
+// LockedPackage represents a resolved and pinned dependency in skink.lock.
+pub struct LockedPackage {
+    Key:       string // Canonical module path: "mod/<owner>/<repo>"
+    Version:   string // Exact resolved version tag (e.g. "v1.0.2")
+    Source:    string // Source repository URL or mirror path
+    Sha256:    string // SHA-256 digest of the package content/archive
+    TargetEnv: string // Target compatibility mode of the resolved package
+}
+
+// Lockfile represents a parsed skink.lock file.
+pub struct Lockfile {
+    Packages: []LockedPackage // Locked packages in deterministic order
+}
+
+// DefaultManifest creates a default Manifest for `scales init`.
+pub fn DefaultManifest(name: string, author: string, bareMetal: bool) -> Manifest {
+    env := "std"
+    osName := "any"
+    if bareMetal {
+        env = "bare-metal"
+        osName = "none"
+    }
+    var deps []Dependency
+    return Manifest{
+        Package: PackageMeta{
+            Name:        name,
+            Version:     "0.1.0",
+            Author:      author,
+            Entry:       "main.skink",
+            Description: "",
+            License:     "Apache-2.0"
+        },
+        Target: TargetConfig{
+            Env:   env,
+            NoStd: bareMetal,
+            OS:    osName,
+            Arch:  "any"
+        },
+        Dependencies: deps
+    }
+}
+
+// stripComment strips a '#' comment from a TOML line while respecting double quotes.
+fn stripComment(line: string) -> string {
+    inQuotes := false
+    n := str.Len(line)
+    for i := 0; i < n; i = i + 1 {
+        c := line[i]
+        if c == 34 { // '"'
+            if i == 0 || line[i - 1] != 92 {
+                inQuotes = !inQuotes
+            }
+        } else if c == 35 && !inQuotes { // '#'
+            return str.Substr(line, 0, i)
+        }
+    }
+    return line
+}
+
+// unquote removes surrounding double or single quotes from a TOML string literal.
+fn unquote(s: string) -> string {
+    t := str.Trim(s)
+    n := str.Len(t)
+    if n >= 2 {
+        if (t[0] == 34 && t[n - 1] == 34) || (t[0] == 39 && t[n - 1] == 39) {
+            return str.Substr(t, 1, n - 2)
+        }
+    }
+    return t
+}
+
+// parseInlineTable extracts `version` and `target` fields from a TOML inline
+// table such as `{ version = "^1.0.2", target = "no-std" }`.
+fn parseInlineTable(val: string) -> (string, string) {
+    v := str.Trim(val)
+    if str.StartsWith(v, "{") && str.EndsWith(v, "}") {
+        v = str.Substr(v, 1, str.Len(v) - 2)
+    }
+    version := "latest"
+    targetEnv := "any"
+    fields := str.Split(v, ",")
+    for i := 0; i < len(fields); i = i + 1 {
+        pair := str.Trim(fields[i])
+        eq := str.IndexOf(pair, "=")
+        if eq > 0 {
+            k := unquote(str.Substr(pair, 0, eq))
+            fv := unquote(str.Substr(pair, eq + 1, str.Len(pair) - eq - 1))
+            if str.Equal(k, "version") {
+                version = fv
+            } else if str.Equal(k, "target") || str.Equal(k, "env") {
+                targetEnv = fv
+            }
+        }
+    }
+    return version, targetEnv
+}
+
+// ParseTOML parses the contents of a `skink.toml` file into a Manifest.
+pub fn ParseTOML(content: string) -> (Manifest, errors.Error) {
+    m := DefaultManifest("", "", false)
+    section := ""
+    lines := str.Split(content, "\n")
+    for i := 0; i < len(lines); i = i + 1 {
+        rawLine := str.Replace(lines[i], "\r", "")
+        cleaned := str.Trim(stripComment(rawLine))
+        if str.Len(cleaned) == 0 {
+            continue
+        }
+        if str.StartsWith(cleaned, "[") && str.EndsWith(cleaned, "]") {
+            section = str.Trim(str.Substr(cleaned, 1, str.Len(cleaned) - 2))
+            continue
+        }
+        eqIdx := str.IndexOf(cleaned, "=")
+        if eqIdx < 0 {
+            continue
+        }
+        key := unquote(str.Substr(cleaned, 0, eqIdx))
+        val := str.Trim(str.Substr(cleaned, eqIdx + 1, str.Len(cleaned) - eqIdx - 1))
+
+        if str.Equal(section, "package") {
+            uval := unquote(val)
+            if str.Equal(key, "name") {
+                m.Package.Name = uval
+            } else if str.Equal(key, "version") {
+                m.Package.Version = uval
+            } else if str.Equal(key, "author") {
+                m.Package.Author = uval
+            } else if str.Equal(key, "entry") {
+                m.Package.Entry = uval
+            } else if str.Equal(key, "description") {
+                m.Package.Description = uval
+            } else if str.Equal(key, "license") {
+                m.Package.License = uval
+            }
+        } else if str.Equal(section, "target") {
+            uval := unquote(val)
+            if str.Equal(key, "env") || str.Equal(key, "profile") {
+                m.Target.Env = uval
+                if str.Equal(uval, "no-std") || str.Equal(uval, "bare-metal") || str.Equal(uval, "freestanding") {
+                    m.Target.NoStd = true
+                }
+            } else if str.Equal(key, "no_std") || str.Equal(key, "no-std") {
+                m.Target.NoStd = str.Equal(uval, "true") || str.Equal(uval, "1")
+                if m.Target.NoStd && str.Equal(m.Target.Env, "std") {
+                    m.Target.Env = "no-std"
+                }
+            } else if str.Equal(key, "os") {
+                m.Target.OS = uval
+            } else if str.Equal(key, "arch") {
+                m.Target.Arch = uval
+            }
+        } else if str.Equal(section, "dependencies") {
+            spec := modres.ParseSpec(key, false)
+            if !spec.Valid {
+                return m, errors.New(str.Concat("invalid dependency key in skink.toml: ", key))
+            }
+            constraint := "latest"
+            targetEnv := "any"
+            if str.StartsWith(val, "{") {
+                constraint, targetEnv = parseInlineTable(val)
+            } else {
+                constraint = unquote(val)
+            }
+            if str.Len(constraint) == 0 {
+                constraint = "latest"
+            }
+            SetDependency(&m, spec.Owner, spec.Repo, constraint, targetEnv)
+        }
+    }
+    return m, errors.New("")
+}
+
+// ParseMod parses a lightweight line-oriented `skink.mod` manifest file.
+pub fn ParseMod(content: string) -> (Manifest, errors.Error) {
+    m := DefaultManifest("", "", false)
+    inRequire := false
+    lines := str.Split(content, "\n")
+    for i := 0; i < len(lines); i = i + 1 {
+        rawLine := str.Replace(lines[i], "\r", "")
+        cleaned := str.Trim(stripComment(rawLine))
+        if str.Len(cleaned) == 0 {
+            continue
+        }
+        if str.Equal(cleaned, ")") {
+            inRequire = false
+            continue
+        }
+        if str.StartsWith(cleaned, "require (") || str.Equal(cleaned, "require(") {
+            inRequire = true
+            continue
+        }
+        if inRequire {
+            parts := str.Split(cleaned, " ")
+            var tokens []string
+            for j := 0; j < len(parts); j = j + 1 {
+                t := str.Trim(parts[j])
+                if str.Len(t) > 0 {
+                    tokens = append(tokens, t)
+                }
+            }
+            if len(tokens) >= 1 {
+                spec := modres.ParseSpec(unquote(tokens[0]), false)
+                if spec.Valid {
+                    ver := spec.Version
+                    if len(tokens) >= 2 && str.Len(ver) == 0 {
+                        ver = unquote(tokens[1])
+                    }
+                    if str.Len(ver) == 0 {
+                        ver = "latest"
+                    }
+                    SetDependency(&m, spec.Owner, spec.Repo, ver, "any")
+                }
+            }
+            continue
+        }
+        if str.StartsWith(cleaned, "module ") {
+            m.Package.Name = unquote(str.Trim(str.Substr(cleaned, 7, str.Len(cleaned) - 7)))
+        } else if str.StartsWith(cleaned, "version ") {
+            m.Package.Version = unquote(str.Trim(str.Substr(cleaned, 8, str.Len(cleaned) - 8)))
+        } else if str.StartsWith(cleaned, "author ") {
+            m.Package.Author = unquote(str.Trim(str.Substr(cleaned, 7, str.Len(cleaned) - 7)))
+        } else if str.StartsWith(cleaned, "target ") {
+            tval := unquote(str.Trim(str.Substr(cleaned, 7, str.Len(cleaned) - 7)))
+            m.Target.Env = tval
+            m.Target.NoStd = str.Equal(tval, "no-std") || str.Equal(tval, "bare-metal")
+        } else if str.StartsWith(cleaned, "require ") {
+            rest := str.Trim(str.Substr(cleaned, 8, str.Len(cleaned) - 8))
+            parts := str.Split(rest, " ")
+            if len(parts) >= 1 {
+                spec := modres.ParseSpec(unquote(parts[0]), false)
+                if spec.Valid {
+                    ver := spec.Version
+                    if len(parts) >= 2 && str.Len(ver) == 0 {
+                        ver = unquote(parts[len(parts) - 1])
+                    }
+                    if str.Len(ver) == 0 {
+                        ver = "latest"
+                    }
+                    SetDependency(&m, spec.Owner, spec.Repo, ver, "any")
+                }
+            }
+        }
+    }
+    return m, errors.New("")
+}
+
+// SetDependency adds or updates a dependency in the Manifest.
+pub fn SetDependency(m: *Manifest, owner: string, repo: string, constraint: string, targetEnv: string) {
+    key := str.Concat("mod/", str.Concat(owner, str.Concat("/", repo)))
+    if str.Len(targetEnv) == 0 {
+        targetEnv = "any"
+    }
+    for i := 0; i < len(m.Dependencies); i = i + 1 {
+        if str.Equal(m.Dependencies[i].Key, key) {
+            m.Dependencies[i].Constraint = constraint
+            if !str.Equal(targetEnv, "any") {
+                m.Dependencies[i].TargetEnv = targetEnv
+            }
+            return
+        }
+    }
+    m.Dependencies = append(m.Dependencies, Dependency{
+        Key:        key,
+        Owner:      owner,
+        Repo:       repo,
+        Constraint: constraint,
+        TargetEnv:  targetEnv
+    })
+}
+
+// RemoveDependency removes a dependency by canonical key ("mod/<owner>/<repo>")
+// and returns true if it was present.
+pub fn RemoveDependency(m: *Manifest, owner: string, repo: string) -> bool {
+    key := str.Concat("mod/", str.Concat(owner, str.Concat("/", repo)))
+    var kept []Dependency
+    found := false
+    for i := 0; i < len(m.Dependencies); i = i + 1 {
+        if str.Equal(m.Dependencies[i].Key, key) {
+            found = true
+        } else {
+            kept = append(kept, m.Dependencies[i])
+        }
+    }
+    m.Dependencies = kept
+    return found
+}
+
+// FindDependency looks up a dependency in the Manifest by owner and repo.
+pub fn FindDependency(m: Manifest, owner: string, repo: string) -> (Dependency, bool) {
+    key := str.Concat("mod/", str.Concat(owner, str.Concat("/", repo)))
+    for i := 0; i < len(m.Dependencies); i = i + 1 {
+        if str.Equal(m.Dependencies[i].Key, key) {
+            return m.Dependencies[i], true
+        }
+    }
+    return Dependency{}, false
+}
+
+// FormatTOML serializes a Manifest to canonical `skink.toml` text.
+pub fn FormatTOML(m: Manifest) -> string {
+    b := str.NewBuilder(512)
+    b.Write("# Skink Project Manifest (managed by scales)\n\n")
+    b.Write("[package]\n")
+    b.Write(str.Concat("name = \"", str.Concat(m.Package.Name, "\"\n")))
+    b.Write(str.Concat("version = \"", str.Concat(m.Package.Version, "\"\n")))
+    b.Write(str.Concat("author = \"", str.Concat(m.Package.Author, "\"\n")))
+    if str.Len(m.Package.Entry) > 0 {
+        b.Write(str.Concat("entry = \"", str.Concat(m.Package.Entry, "\"\n")))
+    }
+    if str.Len(m.Package.Description) > 0 {
+        b.Write(str.Concat("description = \"", str.Concat(m.Package.Description, "\"\n")))
+    }
+    if str.Len(m.Package.License) > 0 {
+        b.Write(str.Concat("license = \"", str.Concat(m.Package.License, "\"\n")))
+    }
+
+    b.Write("\n[target]\n")
+    env := m.Target.Env
+    if str.Len(env) == 0 {
+        if m.Target.NoStd {
+            env = "no-std"
+        } else {
+            env = "std"
+        }
+    }
+    b.Write(str.Concat("env = \"", str.Concat(env, "\"\n")))
+    if m.Target.NoStd {
+        b.Write("no_std = true\n")
+    } else {
+        b.Write("no_std = false\n")
+    }
+    osVal := m.Target.OS
+    if str.Len(osVal) == 0 {
+        osVal = "any"
+    }
+    archVal := m.Target.Arch
+    if str.Len(archVal) == 0 {
+        archVal = "any"
+    }
+    b.Write(str.Concat("os = \"", str.Concat(osVal, "\"\n")))
+    b.Write(str.Concat("arch = \"", str.Concat(archVal, "\"\n")))
+
+    b.Write("\n[dependencies]\n")
+    for i := 0; i < len(m.Dependencies); i = i + 1 {
+        dep := m.Dependencies[i]
+        if str.Len(dep.TargetEnv) > 0 && !str.Equal(dep.TargetEnv, "any") {
+            b.Write(str.Concat("\"", str.Concat(dep.Key, str.Concat("\" = { version = \"", str.Concat(dep.Constraint, str.Concat("\", target = \"", str.Concat(dep.TargetEnv, "\" }\n")))))))
+        } else {
+            b.Write(str.Concat("\"", str.Concat(dep.Key, str.Concat("\" = \"", str.Concat(dep.Constraint, "\"\n")))))
+        }
+    }
+    out := b.String()
+    b.Free()
+    return out
+}
+
+// CheckTargetCompatibility verifies whether a dependency's target configuration
+// is compatible with the consuming project's target configuration.
+// Returns (true, "") when compatible, or (false, reason) on conflict.
+pub fn CheckTargetCompatibility(project: TargetConfig, dep: TargetConfig, depExplicitTarget: string) -> (bool, string) {
+    // If project is no_std / bare-metal, check if the dependency explicitly
+    // requires hosted "std".
+    if project.NoStd || str.Equal(project.Env, "no-std") || str.Equal(project.Env, "bare-metal") {
+        if str.Equal(depExplicitTarget, "std") || (str.Equal(dep.Env, "std-only") && !dep.NoStd) {
+            return false, "project targets bare-metal/no-std, but dependency requires standard hosted environment (std)"
+        }
+    }
+    // Check OS constraint if neither is "any" or empty.
+    if str.Len(project.OS) > 0 && !str.Equal(project.OS, "any") && str.Len(dep.OS) > 0 && !str.Equal(dep.OS, "any") {
+        if !str.Equal(project.OS, dep.OS) {
+            return false, str.Concat("target OS mismatch: project targets ", str.Concat(project.OS, str.Concat(" but dependency requires ", dep.OS)))
+        }
+    }
+    // Check Arch constraint if neither is "any" or empty.
+    if str.Len(project.Arch) > 0 && !str.Equal(project.Arch, "any") && str.Len(dep.Arch) > 0 && !str.Equal(dep.Arch, "any") {
+        if !str.Equal(project.Arch, dep.Arch) {
+            return false, str.Concat("target architecture mismatch: project targets ", str.Concat(project.Arch, str.Concat(" but dependency requires ", dep.Arch)))
+        }
+    }
+    return true, ""
+}
+
+// LoadFromDir loads `skink.toml` (or `skink.mod` fallback) from dir.
+pub fn LoadFromDir(dir: string) -> (Manifest, string, errors.Error) {
+    tomlPath := str.Concat(dir, "/skink.toml")
+    if str.EndsWith(dir, "/") || str.EndsWith(dir, "\\") {
+        tomlPath = str.Concat(dir, "skink.toml")
+    }
+    if fs.Exists(tomlPath) {
+        content, err := fs.ReadAll(tomlPath)
+        if err.message != "" {
+            return DefaultManifest("", "", false), tomlPath, err
+        }
+        m, perr := ParseTOML(content)
+        return m, tomlPath, perr
+    }
+    modPath := str.Concat(dir, "/skink.mod")
+    if str.EndsWith(dir, "/") || str.EndsWith(dir, "\\") {
+        modPath = str.Concat(dir, "skink.mod")
+    }
+    if fs.Exists(modPath) {
+        content, err := fs.ReadAll(modPath)
+        if err.message != "" {
+            return DefaultManifest("", "", false), modPath, err
+        }
+        m, perr := ParseMod(content)
+        return m, modPath, perr
+    }
+    return DefaultManifest("", "", false), "", errors.New("no skink.toml or skink.mod found")
+}
+
+// SaveTOML writes Manifest m to `<dir>/skink.toml`.
+pub fn SaveTOML(dir: string, m: Manifest) -> errors.Error {
+    tomlPath := str.Concat(dir, "/skink.toml")
+    if str.EndsWith(dir, "/") || str.EndsWith(dir, "\\") {
+        tomlPath = str.Concat(dir, "skink.toml")
+    }
+    return fs.WriteAll(tomlPath, FormatTOML(m))
+}
+
+// ParseLockfile parses the contents of `skink.lock`.
+pub fn ParseLockfile(content: string) -> Lockfile {
+    var pkgs []LockedPackage
+    var cur LockedPackage
+    inPkg := false
+    lines := str.Split(content, "\n")
+    for i := 0; i < len(lines); i = i + 1 {
+        rawLine := str.Replace(lines[i], "\r", "")
+        cleaned := str.Trim(stripComment(rawLine))
+        if str.Len(cleaned) == 0 {
+            continue
+        }
+        if str.Equal(cleaned, "[[package]]") {
+            if inPkg && str.Len(cur.Key) > 0 {
+                pkgs = append(pkgs, cur)
+            }
+            cur = LockedPackage{Key: "", Version: "", Source: "", Sha256: "", TargetEnv: "any"}
+            inPkg = true
+            continue
+        }
+        if inPkg {
+            eq := str.IndexOf(cleaned, "=")
+            if eq > 0 {
+                k := unquote(str.Substr(cleaned, 0, eq))
+                v := unquote(str.Substr(cleaned, eq + 1, str.Len(cleaned) - eq - 1))
+                if str.Equal(k, "name") || str.Equal(k, "key") {
+                    cur.Key = v
+                } else if str.Equal(k, "version") {
+                    cur.Version = v
+                } else if str.Equal(k, "source") {
+                    cur.Source = v
+                } else if str.Equal(k, "sha256") {
+                    cur.Sha256 = v
+                } else if str.Equal(k, "target") {
+                    cur.TargetEnv = v
+                }
+            }
+        }
+    }
+    if inPkg && str.Len(cur.Key) > 0 {
+        pkgs = append(pkgs, cur)
+    }
+    return Lockfile{Packages: pkgs}
+}
+
+// FormatLockfile serializes a Lockfile to deterministic `skink.lock` text.
+pub fn FormatLockfile(lock: Lockfile) -> string {
+    b := str.NewBuilder(512)
+    b.Write("# This file is automatically generated by scales. Do not edit manually.\n\n")
+    for i := 0; i < len(lock.Packages); i = i + 1 {
+        p := lock.Packages[i]
+        b.Write("[[package]]\n")
+        b.Write(str.Concat("name = \"", str.Concat(p.Key, "\"\n")))
+        b.Write(str.Concat("version = \"", str.Concat(p.Version, "\"\n")))
+        b.Write(str.Concat("source = \"", str.Concat(p.Source, "\"\n")))
+        b.Write(str.Concat("sha256 = \"", str.Concat(p.Sha256, "\"\n")))
+        if str.Len(p.TargetEnv) > 0 {
+            b.Write(str.Concat("target = \"", str.Concat(p.TargetEnv, "\"\n")))
+        }
+        b.Write("\n")
+    }
+    out := b.String()
+    b.Free()
+    return out
+}
+
+// SetLockedPackage inserts or updates a LockedPackage in Lockfile.
+pub fn SetLockedPackage(lock: *Lockfile, pkg: LockedPackage) {
+    for i := 0; i < len(lock.Packages); i = i + 1 {
+        if str.Equal(lock.Packages[i].Key, pkg.Key) {
+            lock.Packages[i] = pkg
+            return
+        }
+    }
+    lock.Packages = append(lock.Packages, pkg)
+}
+
+// FindLockedPackage looks up a LockedPackage by its canonical key ("mod/<owner>/<repo>").
+pub fn FindLockedPackage(lock: Lockfile, key: string) -> (LockedPackage, bool) {
+    for i := 0; i < len(lock.Packages); i = i + 1 {
+        if str.Equal(lock.Packages[i].Key, key) {
+            return lock.Packages[i], true
+        }
+    }
+    return LockedPackage{}, false
+}
+
+// LoadLockfile reads `<dir>/skink.lock` if present.
+pub fn LoadLockfile(dir: string) -> Lockfile {
+    lockPath := str.Concat(dir, "/skink.lock")
+    if str.EndsWith(dir, "/") || str.EndsWith(dir, "\\") {
+        lockPath = str.Concat(dir, "skink.lock")
+    }
+    if !fs.Exists(lockPath) {
+        var empty []LockedPackage
+        return Lockfile{Packages: empty}
+    }
+    content, err := fs.ReadAll(lockPath)
+    if err.message != "" {
+        var empty []LockedPackage
+        return Lockfile{Packages: empty}
+    }
+    return ParseLockfile(content)
+}
+
+// SaveLockfile writes `<dir>/skink.lock`.
+pub fn SaveLockfile(dir: string, lock: Lockfile) -> errors.Error {
+    lockPath := str.Concat(dir, "/skink.lock")
+    if str.EndsWith(dir, "/") || str.EndsWith(dir, "\\") {
+        lockPath = str.Concat(dir, "skink.lock")
+    }
+    return fs.WriteAll(lockPath, FormatLockfile(lock))
+}
