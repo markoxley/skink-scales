@@ -16,7 +16,7 @@ import "std/str"
 import "std/fs"
 
 // ModuleSpec holds the decomposed components of a Skink third-party module
-// specifier such as "mod/markoxley/skink-orm@v1.0.2".
+// specifier such as "mod/markoxley/skink-tegu@v1.0.2".
 pub struct ModuleSpec {
     CanonicalKey: string // Canonical module key: "mod/<owner>/<repo>"
     Owner:        string // GitHub owner / organization name
@@ -47,6 +47,28 @@ fn isSafeIdentChar(c: int) -> bool {
 pub fn IsSafeIdentifier(s: string) -> bool {
     n := str.Len(s)
     if n == 0 || str.Equal(s, ".") || str.Equal(s, "..") {
+        return false
+    }
+    for i := 0; i < n; i = i + 1 {
+        if !isSafeIdentChar(int(s[i])) {
+            return false
+        }
+    }
+    return true
+}
+
+// IsSafeVersion reports whether a version/tag string is safe to embed
+// in cache paths and to pass as an argument to external tools. The
+// charset matches IsSafeIdentifier, plus two extra guards: a leading '-'
+// would be parsed as an option by git clone --branch (e.g.
+// "-c core.sshCommand=..." — command execution, comp_error.md #158),
+// and "."/".." would resolve to the cache root itself.
+pub fn IsSafeVersion(s: string) -> bool {
+    n := str.Len(s)
+    if n == 0 || str.Equal(s, ".") || str.Equal(s, "..") {
+        return false
+    }
+    if s[0] == 45 { // '-'
         return false
     }
     for i := 0; i < n; i = i + 1 {
@@ -171,6 +193,20 @@ pub fn ParseSpec(raw: string, requireModPrefix: bool) -> ModuleSpec {
             Error:        str.Concat("invalid repository name: ", repo)
         }
     }
+    // The version flows into cache paths and `git clone --branch` —
+    // a leading '-' or path metacharacters would inject options or
+    // escape the cache (comp_error.md #158).
+    if str.Len(version) > 0 && !IsSafeVersion(version) {
+        return ModuleSpec{
+            CanonicalKey: "",
+            Owner:        owner,
+            Repo:         repo,
+            Version:      version,
+            Subpath:      subpath,
+            Valid:        false,
+            Error:        str.Concat("invalid version: ", version)
+        }
+    }
 
     canonical := str.Concat("mod/", str.Concat(owner, str.Concat("/", repo)))
     return ModuleSpec{
@@ -184,8 +220,8 @@ pub fn ParseSpec(raw: string, requireModPrefix: bool) -> ModuleSpec {
     }
 }
 
-// SanitizeModuleName converts a repository name (such as "skink-orm") into a
-// valid Skink module identifier ("skink_orm").
+// SanitizeModuleName converts a repository name (such as "skink-tegu") into a
+// valid Skink module identifier ("skink_tegu").
 pub fn SanitizeModuleName(repo: string) -> string {
     s := str.Replace(repo, "-", "_")
     s = str.Replace(s, ".", "_")
@@ -224,18 +260,18 @@ pub fn ResolveEntryFile(pkgDir: string, repo: string, subpath: string, manifestE
         }
     }
 
-    // 1. Check <repo>.skink (e.g. skink-orm.skink)
+    // 1. Check <repo>.skink (e.g. skink-tegu.skink)
     c1 := joinCross(targetDir, str.Concat(repo, ".skink"))
     if fs.IsFile(c1) {
         return c1
     }
-    // 2. Check sanitized <repo_underscore>.skink (e.g. skink_orm.skink)
+    // 2. Check sanitized <repo_underscore>.skink (e.g. skink_tegu.skink)
     sanitized := SanitizeModuleName(repo)
     c2 := joinCross(targetDir, str.Concat(sanitized, ".skink"))
     if fs.IsFile(c2) {
         return c2
     }
-    // 3. If repo starts with "skink-", check stripped name (e.g. orm.skink)
+    // 3. If repo starts with "skink-", check stripped name (e.g. tegu.skink)
     if str.StartsWith(repo, "skink-") && str.Len(repo) > 6 {
         shortName := str.Substr(repo, 6, str.Len(repo) - 6)
         c3 := joinCross(targetDir, str.Concat(shortName, ".skink"))

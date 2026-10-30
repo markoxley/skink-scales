@@ -45,11 +45,27 @@ pub struct Dependency {
     TargetEnv:  string // Optional target compatibility override ("any", "std", "no-std")
 }
 
+// LinkConfig holds the [link] section of skink.toml: native link and
+// compile requirements for the package (system libraries, search paths,
+// C/C++ sources, and extra flags). The compiler driver applies each
+// resolved package's [link] section when invoking clang.
+pub struct LinkConfig {
+    Libs:         []string // System libraries linked as -l<name>
+    LibPaths:     []string // Library search dirs (relative to package root)
+    IncludePaths: []string // Header search dirs (relative to package root)
+    Sources:      []string // C/C++/asm sources compiled into the binary
+    CFlags:       []string // Extra compile flags (each a single '-...' flag)
+    LDFlags:      []string // Extra link flags (each a single '-...' flag)
+    Frameworks:   []string // macOS frameworks (-framework <name>)
+    Present:      bool     // Whether a [link] section was present
+}
+
 // Manifest represents a complete parsed skink.toml (or skink.mod) project file.
 pub struct Manifest {
     Package:      PackageMeta  // Package metadata
     Target:       TargetConfig // Target environment and platform compatibility
     Dependencies: []Dependency // Ordered list of project dependencies
+    Link:         LinkConfig   // Native link requirements ([link] section)
 }
 
 // LockedPackage represents a resolved and pinned dependency in skink.lock.
@@ -149,6 +165,55 @@ fn parseInlineTable(val: string) -> (string, string) {
     return version, targetEnv
 }
 
+// parseStringArray splits a TOML array-of-strings value into its
+// elements (commas inside quotes are preserved). Returns nil when the
+// value is not bracketed.
+fn parseStringArray(val: string) -> []string {
+    v := str.Trim(val)
+    if str.Len(v) < 2 || v[0] != 91 || v[str.Len(v) - 1] != 93 { // '[' ']'
+        var empty []string
+        return empty
+    }
+    var out []string
+    inner := str.Substr(v, 1, str.Len(v) - 2)
+    cur := ""
+    inQ := false
+    qc := 0
+    n := str.Len(inner)
+    for i := 0; i < n; i = i + 1 {
+        c := inner[i]
+        if (c == 34 || c == 39) && !inQ {
+            inQ = true
+            qc = c
+        } else if inQ && c == qc {
+            inQ = false
+        } else if c == 44 && !inQ { // ','
+            if str.Len(str.Trim(cur)) > 0 {
+                out = append(out, unquote(cur))
+            }
+            cur = ""
+        } else {
+            cur = str.Concat(cur, str.Substr(inner, i, 1))
+        }
+    }
+    if str.Len(str.Trim(cur)) > 0 {
+        out = append(out, unquote(cur))
+    }
+    return out
+}
+
+// quoteArray serializes a []string as a TOML array literal.
+fn quoteArray(items: []string) -> string {
+    b := "["
+    for i := 0; i < len(items); i = i + 1 {
+        if i > 0 {
+            b = str.Concat(b, ", ")
+        }
+        b = str.Concat(b, str.Concat("\"", str.Concat(items[i], "\"")))
+    }
+    return str.Concat(b, "]")
+}
+
 // ParseTOML parses the contents of a `skink.toml` file into a Manifest.
 pub fn ParseTOML(content: string) -> (Manifest, errors.Error) {
     m := DefaultManifest("", "", false)
@@ -170,6 +235,18 @@ pub fn ParseTOML(content: string) -> (Manifest, errors.Error) {
         }
         key := unquote(str.Substr(cleaned, 0, eqIdx))
         val := str.Trim(str.Substr(cleaned, eqIdx + 1, str.Len(cleaned) - eqIdx - 1))
+        // A '[' value that does not close on this line is a multi-line
+        // array — keep consuming the following lines until the ']'.
+        if str.StartsWith(val, "[") && !str.Contains(val, "]") {
+            for i + 1 < len(lines) {
+                i = i + 1
+                more := str.Trim(stripComment(str.Replace(lines[i], "\r", "")))
+                val = str.Concat(val, str.Concat(" ", more))
+                if str.Contains(more, "]") {
+                    break
+                }
+            }
+        }
 
         if str.Equal(section, "package") {
             uval := unquote(val)
@@ -219,6 +296,26 @@ pub fn ParseTOML(content: string) -> (Manifest, errors.Error) {
                 constraint = "latest"
             }
             SetDependency(&m, spec.Owner, spec.Repo, constraint, targetEnv)
+        } else if str.Equal(section, "link") {
+            // Native link requirements for the package — honored by the
+            // compiler driver when this package is a resolved dependency.
+            m.Link.Present = true
+            arr := parseStringArray(val)
+            if str.Equal(key, "libs") {
+                m.Link.Libs = arr
+            } else if str.Equal(key, "lib_paths") {
+                m.Link.LibPaths = arr
+            } else if str.Equal(key, "include_paths") {
+                m.Link.IncludePaths = arr
+            } else if str.Equal(key, "sources") {
+                m.Link.Sources = arr
+            } else if str.Equal(key, "cflags") {
+                m.Link.CFlags = arr
+            } else if str.Equal(key, "ldflags") {
+                m.Link.LDFlags = arr
+            } else if str.Equal(key, "frameworks") {
+                m.Link.Frameworks = arr
+            }
         }
     }
     return m, errors.New("")
@@ -393,6 +490,31 @@ pub fn FormatTOML(m: Manifest) -> string {
     }
     b.Write(str.Concat("os = \"", str.Concat(osVal, "\"\n")))
     b.Write(str.Concat("arch = \"", str.Concat(archVal, "\"\n")))
+
+    if m.Link.Present {
+        b.Write("\n[link]\n")
+        if len(m.Link.Libs) > 0 {
+            b.Write(str.Concat("libs = ", str.Concat(quoteArray(m.Link.Libs), "\n")))
+        }
+        if len(m.Link.LibPaths) > 0 {
+            b.Write(str.Concat("lib_paths = ", str.Concat(quoteArray(m.Link.LibPaths), "\n")))
+        }
+        if len(m.Link.IncludePaths) > 0 {
+            b.Write(str.Concat("include_paths = ", str.Concat(quoteArray(m.Link.IncludePaths), "\n")))
+        }
+        if len(m.Link.Sources) > 0 {
+            b.Write(str.Concat("sources = ", str.Concat(quoteArray(m.Link.Sources), "\n")))
+        }
+        if len(m.Link.CFlags) > 0 {
+            b.Write(str.Concat("cflags = ", str.Concat(quoteArray(m.Link.CFlags), "\n")))
+        }
+        if len(m.Link.LDFlags) > 0 {
+            b.Write(str.Concat("ldflags = ", str.Concat(quoteArray(m.Link.LDFlags), "\n")))
+        }
+        if len(m.Link.Frameworks) > 0 {
+            b.Write(str.Concat("frameworks = ", str.Concat(quoteArray(m.Link.Frameworks), "\n")))
+        }
+    }
 
     b.Write("\n[dependencies]\n")
     for i := 0; i < len(m.Dependencies); i = i + 1 {

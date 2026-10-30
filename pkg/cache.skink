@@ -703,10 +703,65 @@ pub fn IsPackageCached(owner: string, repo: string, version: string) -> bool {
     return len(entries) > 0
 }
 
+// tarPathUnsafe reports whether a single archive member path contains
+// segments that could escape the extraction directory: absolute paths,
+// "." / ".." segments, empty segments ("a//b" or a trailing "/"), or
+// backslashes. Trailing slashes on directory members are tolerated.
+fn tarPathUnsafe(path: string) -> bool {
+    n := str.Len(path)
+    if n == 0 {
+        return true
+    }
+    if path[0] == 47 { // '/'
+        return true
+    }
+    if str.Contains(path, "\\") {
+        return true
+    }
+    s := path
+    if str.EndsWith(s, "/") {
+        s = str.Substr(s, 0, str.Len(s) - 1)
+    }
+    if str.Len(s) == 0 {
+        return true
+    }
+    parts := str.Split(s, "/")
+    for i := 0; i < len(parts); i = i + 1 {
+        seg := parts[i]
+        if str.Len(seg) == 0 || str.Equal(seg, ".") || str.Equal(seg, "..") {
+            return true
+        }
+    }
+    return false
+}
+
+// tarMemberUnsafe reports whether an archive member is unsafe to
+// extract. The member is checked as-is AND after --strip-components=1
+// removes its first component — a member like "top/../../x" survives the
+// strip with the escape intact (tar-slip, comp_error.md #158).
+pub fn TarMemberUnsafe(name: string) -> bool {
+    if tarPathUnsafe(name) {
+        return true
+    }
+    slash := str.IndexOf(name, "/")
+    if slash < 0 {
+        return false // top-level file
+    }
+    rest := str.Substr(name, slash + 1, str.Len(name) - slash - 1)
+    return tarPathUnsafe(rest)
+}
+
 // FetchPackage ensures that <owner>/<repo>@<version> is downloaded and unpacked
 // in the local cache (<cache_root>/packages/<owner>/<repo>/<version>/).
 // If the package is already cached, it returns immediately without network I/O.
 pub fn FetchPackage(owner: string, repo: string, version: string, offline: bool) -> (CachedPackage, errors.Error) {
+    // The version flows into cache paths and `git clone --branch` — a
+    // leading '-' or path metacharacter would inject options or escape
+    // the cache (comp_error.md #158). Defense in depth: versions also
+    // arrive from skink.lock/skink.toml, bypassing ParseSpec.
+    if !modres.IsSafeVersion(version) {
+        return CachedPackage{}, errors.New(str.Concat("invalid version: ", version))
+    }
     err := EnsureCacheDirs()
     if err.message != "" {
         return CachedPackage{}, err
@@ -796,8 +851,27 @@ pub fn FetchPackage(owner: string, repo: string, version: string, offline: bool)
         if err.message != "" {
             return CachedPackage{}, err
         }
+        // List the archive members and reject any that could escape the
+        // install directory — ".." segments or absolute paths let a
+        // malicious archive overwrite arbitrary user files (tar-slip,
+        // comp_error.md #158).
+        memOut, lrc := os.ExecWithOutput([]string{"tar", "-tzf", archivePath})
+        if lrc != 0 {
+            return CachedPackage{}, errors.New(str.Concat("cannot read archive for ", key))
+        }
+        memberLines := str.Split(memOut, "\n")
+        for mi := 0; mi < len(memberLines); mi = mi + 1 {
+            if str.Len(memberLines[mi]) == 0 {
+                continue
+            }
+            if TarMemberUnsafe(memberLines[mi]) {
+                return CachedPackage{}, errors.New(str.Concat("unsafe archive member in ", str.Concat(key, str.Concat("@", version))))
+            }
+        }
         // Extract tarball stripping the top-level "<repo>-<tag>/" directory.
-        _, trc := os.ExecWithOutput([]string{"tar", "-xzf", archivePath, "-C", installDir, "--strip-components=1"})
+        // --no-same-owner/--no-same-permissions prevent the archive from
+        // restoring ownership or setuid bits.
+        _, trc := os.ExecWithOutput([]string{"tar", "-xzf", archivePath, "-C", installDir, "--strip-components=1", "--no-same-owner", "--no-same-permissions"})
         if trc == 0 && IsPackageCached(owner, repo, version) {
             sha := ComputePackageHash(installDir)
             writePackageMeta(installDir, owner, repo, version, sha, sourceUrl)
@@ -817,12 +891,15 @@ pub fn FetchPackage(owner: string, repo: string, version: string, offline: bool)
     }
 
     // 4. Fallback: shallow git clone for the requested tag/branch.
+    // --branch=<version> (joined form) plus a "--" separator so a
+    // version string can never be parsed as a git option
+    // (comp_error.md #158; IsSafeVersion also rejects leading '-').
     gitUrl := str.Concat("https://github.com/", str.Concat(owner, str.Concat("/", str.Concat(repo, ".git"))))
     err = MkdirAll(RepoPackagesDir(owner, repo))
     if err.message != "" {
         return CachedPackage{}, err
     }
-    _, grc := os.ExecWithOutput([]string{"git", "clone", "--depth", "1", "--branch", version, gitUrl, installDir})
+    _, grc := os.ExecWithOutput([]string{"git", "clone", "--depth", "1", str.Concat("--branch=", version), "--", gitUrl, installDir})
     if grc == 0 && IsPackageCached(owner, repo, version) {
         RemoveDirRecursive(JoinPath(installDir, ".git"))
         sha := ComputePackageHash(installDir)

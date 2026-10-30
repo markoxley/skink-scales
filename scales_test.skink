@@ -69,22 +69,22 @@ pub fn TestSemVerConstraints() {
 // TestModResParseSpec verifies parsing of `mod/<owner>/<repo>[@version]`
 // specifiers and Windows/Linux path normalization.
 pub fn TestModResParseSpec() {
-    s1 := modres.ParseSpec("mod/markoxley/skink-orm@v1.0.2", true)
-    testing.AssertTrue(s1.Valid, "mod/markoxley/skink-orm@v1.0.2 is valid")
-    testing.AssertEqualString("mod/markoxley/skink-orm", s1.CanonicalKey, "canonical key")
+    s1 := modres.ParseSpec("mod/markoxley/skink-tegu@v1.0.2", true)
+    testing.AssertTrue(s1.Valid, "mod/markoxley/skink-tegu@v1.0.2 is valid")
+    testing.AssertEqualString("mod/markoxley/skink-tegu", s1.CanonicalKey, "canonical key")
     testing.AssertEqualString("markoxley", s1.Owner, "owner")
-    testing.AssertEqualString("skink-orm", s1.Repo, "repo")
+    testing.AssertEqualString("skink-tegu", s1.Repo, "repo")
     testing.AssertEqualString("v1.0.2", s1.Version, "version")
 
-    s2 := modres.ParseSpec("mod/markoxley/skink-orm", true)
+    s2 := modres.ParseSpec("mod/markoxley/skink-tegu", true)
     testing.AssertTrue(s2.Valid, "omitted @version is valid")
     testing.AssertEqualString("", s2.Version, "empty version when omitted")
 
     // Windows backslash normalization
-    sWin := modres.ParseSpec("mod\\markoxley\\skink-orm@v1.0.2", true)
+    sWin := modres.ParseSpec("mod\\markoxley\\skink-tegu@v1.0.2", true)
     testing.AssertTrue(sWin.Valid, "Windows backslash specifier is normalized")
     testing.AssertEqualString("markoxley", sWin.Owner, "owner from Windows path")
-    testing.AssertEqualString("skink-orm", sWin.Repo, "repo from Windows path")
+    testing.AssertEqualString("skink-tegu", sWin.Repo, "repo from Windows path")
 
     // Invalid specifier rejection
     sBad := modres.ParseSpec("std/io", true)
@@ -96,7 +96,7 @@ pub fn TestModResParseSpec() {
 pub fn TestManifestAndTargetCompatibility() {
     m := manifest.DefaultManifest("telemetry-node", "mark", true)
     manifest.SetDependency(&m, "markoxley", "skink-hal", "^0.2.0", "no-std")
-    manifest.SetDependency(&m, "markoxley", "skink-orm", "v1.0.2", "any")
+    manifest.SetDependency(&m, "markoxley", "skink-tegu", "v1.0.2", "any")
 
     tomlText := manifest.FormatTOML(m)
     parsed, err := manifest.ParseTOML(tomlText)
@@ -115,6 +115,36 @@ pub fn TestManifestAndTargetCompatibility() {
     testing.AssertTrue(ok2, "bare-metal project accepts no-std dependency")
 }
 
+// TestManifestLinkSection verifies [link] parsing, multi-line arrays,
+// and that FormatTOML preserves the section on round-trip (so
+// `scales add`-driven rewrites do not silently drop it).
+pub fn TestManifestLinkSection() {
+    src := "[package]\nname=\"cv\"\nentry=\"cv.skink\"\n\n" +
+        "[link]\n" +
+        "libs=[\"opencv_core\", \"opencv_imgproc\"]\n" +
+        "lib_paths=[\"native/lib\"]\n" +
+        "include_paths=[\"native/include\"]\n" +
+        "sources=[\n  \"native/shim.cpp\"\n]\n" +
+        "cflags=[\"-fPIC\"]\n" +
+        "ldflags=[\"-Wl,-rpath,/opt/x\"]\n" +
+        "frameworks=[\"Cocoa\"]\n"
+    m, err := manifest.ParseTOML(src)
+    testing.AssertEqualString("", err.message, "ParseTOML succeeds")
+    testing.AssertTrue(m.Link.Present, "[link] section detected")
+    testing.AssertEqualInt(2, len(m.Link.Libs), "two libs parsed")
+    testing.AssertEqualString("opencv_imgproc", m.Link.Libs[1], "second lib")
+    testing.AssertEqualInt(1, len(m.Link.Sources), "multi-line sources array parsed")
+    testing.AssertEqualString("native/shim.cpp", m.Link.Sources[0], "source path")
+    testing.AssertEqualString("-Wl,-rpath,/opt/x", m.Link.LDFlags[0], "ldflags entry")
+
+    out := manifest.FormatTOML(m)
+    reparsed, err2 := manifest.ParseTOML(out)
+    testing.AssertEqualString("", err2.message, "re-parse succeeds")
+    testing.AssertTrue(reparsed.Link.Present, "[link] survives FormatTOML round-trip")
+    testing.AssertEqualInt(2, len(reparsed.Link.Libs), "libs survive round-trip")
+    testing.AssertEqualInt(1, len(reparsed.Link.Frameworks), "frameworks survive round-trip")
+}
+
 // TestCacheAndEndToEndCLI verifies local index caching, offline package caching,
 // and the full scales CLI lifecycle (init, add, install/restore, update, list,
 // resolve).
@@ -126,19 +156,19 @@ pub fn TestCacheAndEndToEndCLI() {
     cacheDir := cache.JoinPath(testBase, "scales_cache")
     projDir := cache.JoinPath(testBase, "my_app")
 
-    // Populate a local GitHub mirror with two versions of markoxley/skink-orm:
+    // Populate a local GitHub mirror with two versions of markoxley/skink-tegu:
     // v1.0.2 and v1.1.0.
-    v102 := cache.JoinPath(mirrorDir, "markoxley/skink-orm/v1.0.2")
-    v110 := cache.JoinPath(mirrorDir, "markoxley/skink-orm/v1.1.0")
+    v102 := cache.JoinPath(mirrorDir, "markoxley/skink-tegu/v1.0.2")
+    v110 := cache.JoinPath(mirrorDir, "markoxley/skink-tegu/v1.1.0")
     cache.MkdirAll(v102)
     cache.MkdirAll(v110)
     cache.MkdirAll(projDir)
 
-    fs.WriteAll(cache.JoinPath(v102, "skink.toml"), "[package]\nname = \"skink-orm\"\nversion = \"1.0.2\"\nauthor = \"markoxley\"\nentry = \"orm.skink\"\n\n[target]\nenv = \"std\"\nno_std = false\n")
-    fs.WriteAll(cache.JoinPath(v102, "orm.skink"), "module orm\n\npub fn Connect() -> string {\n    return \"orm-v1.0.2\"\n}\n")
+    fs.WriteAll(cache.JoinPath(v102, "skink.toml"), "[package]\nname = \"skink-tegu\"\nversion = \"1.0.2\"\nauthor = \"markoxley\"\nentry = \"tegu.skink\"\n\n[target]\nenv = \"std\"\nno_std = false\n")
+    fs.WriteAll(cache.JoinPath(v102, "tegu.skink"), "module tegu\n\npub fn Connect() -> string {\n    return \"tegu-v1.0.2\"\n}\n")
 
-    fs.WriteAll(cache.JoinPath(v110, "skink.toml"), "[package]\nname = \"skink-orm\"\nversion = \"1.1.0\"\nauthor = \"markoxley\"\nentry = \"orm.skink\"\n\n[target]\nenv = \"std\"\nno_std = false\n")
-    fs.WriteAll(cache.JoinPath(v110, "orm.skink"), "module orm\n\npub fn Connect() -> string {\n    return \"orm-v1.1.0\"\n}\n")
+    fs.WriteAll(cache.JoinPath(v110, "skink.toml"), "[package]\nname = \"skink-tegu\"\nversion = \"1.1.0\"\nauthor = \"markoxley\"\nentry = \"tegu.skink\"\n\n[target]\nenv = \"std\"\nno_std = false\n")
+    fs.WriteAll(cache.JoinPath(v110, "tegu.skink"), "module tegu\n\npub fn Connect() -> string {\n    return \"tegu-v1.1.0\"\n}\n")
 
     os.Setenv("SCALES_CACHE_DIR", cacheDir)
     os.Setenv("SCALES_GITHUB_MIRROR", mirrorDir)
@@ -152,10 +182,10 @@ pub fn TestCacheAndEndToEndCLI() {
     testing.AssertEqualInt(0, rcInit, "scales init should exit 0")
     testing.AssertTrue(fs.IsFile(cache.JoinPath(projDir, "skink.toml")), "skink.toml created by scales init")
 
-    // 2. scales add mod/markoxley/skink-orm@v1.0.2
-    _, rcAdd := os.ExecWithOutput([]string{scalesBin, "add", "mod/markoxley/skink-orm@v1.0.2"})
-    testing.AssertEqualInt(0, rcAdd, "scales add mod/markoxley/skink-orm@v1.0.2 should exit 0")
-    testing.AssertTrue(cache.IsPackageCached("markoxley", "skink-orm", "v1.0.2"), "v1.0.2 should be in local cache")
+    // 2. scales add mod/markoxley/skink-tegu@v1.0.2
+    _, rcAdd := os.ExecWithOutput([]string{scalesBin, "add", "mod/markoxley/skink-tegu@v1.0.2"})
+    testing.AssertEqualInt(0, rcAdd, "scales add mod/markoxley/skink-tegu@v1.0.2 should exit 0")
+    testing.AssertTrue(cache.IsPackageCached("markoxley", "skink-tegu", "v1.0.2"), "v1.0.2 should be in local cache")
     testing.AssertTrue(fs.IsFile(cache.GlobalIndexPath()), "global index.json created in local index cache")
 
     // 3. scales restore --offline (verifies offline install from local cache without network/mirror)
@@ -163,40 +193,121 @@ pub fn TestCacheAndEndToEndCLI() {
     _, rcRestore := os.ExecWithOutput([]string{scalesBin, "restore", "--offline"})
     testing.AssertEqualInt(0, rcRestore, "scales restore --offline should succeed from local cache")
 
-    // 4. scales resolve mod/markoxley/skink-orm@v1.0.2
-    resOut, rcRes := os.ExecWithOutput([]string{scalesBin, "resolve", "mod/markoxley/skink-orm@v1.0.2"})
+    // 4. scales resolve mod/markoxley/skink-tegu@v1.0.2
+    resOut, rcRes := os.ExecWithOutput([]string{scalesBin, "resolve", "mod/markoxley/skink-tegu@v1.0.2"})
     testing.AssertEqualInt(0, rcRes, "scales resolve should exit 0")
-    testing.AssertTrue(str.Contains(resOut, "markoxley/skink-orm/v1.0.2/orm.skink"), "resolved path points to cached orm.skink")
+    testing.AssertTrue(str.Contains(resOut, "markoxley/skink-tegu/v1.0.2/tegu.skink"), "resolved path points to cached tegu.skink")
 
     // 5. scales update (re-enable mirror so v1.1.0 is discovered and applied)
     os.Setenv("SCALES_GITHUB_MIRROR", mirrorDir)
     _, rcUpdate := os.ExecWithOutput([]string{scalesBin, "update"})
     testing.AssertEqualInt(0, rcUpdate, "scales update should exit 0")
-    testing.AssertTrue(cache.IsPackageCached("markoxley", "skink-orm", "v1.1.0"), "scales update should fetch and cache v1.1.0")
+    testing.AssertTrue(cache.IsPackageCached("markoxley", "skink-tegu", "v1.1.0"), "scales update should fetch and cache v1.1.0")
 
     lock := manifest.LoadLockfile(projDir)
-    lockedPkg, foundLock := manifest.FindLockedPackage(lock, "mod/markoxley/skink-orm")
-    testing.AssertTrue(foundLock, "skink.lock should contain mod/markoxley/skink-orm")
+    lockedPkg, foundLock := manifest.FindLockedPackage(lock, "mod/markoxley/skink-tegu")
+    testing.AssertTrue(foundLock, "skink.lock should contain mod/markoxley/skink-tegu")
     testing.AssertEqualString("v1.1.0", lockedPkg.Version, "skink.lock should be updated to v1.1.0")
 
     // 6. Compile and run a Skink source file using explicit @v1.0.2 import
-    explicitSrc := "module main\n\nimport \"mod/markoxley/skink-orm@v1.0.2\"\n\nfn main() -> int {\n    println(orm.Connect())\n    return 0\n}\n"
+    explicitSrc := "module main\n\nimport \"mod/markoxley/skink-tegu@v1.0.2\"\n\nfn main() -> int {\n    println(tegu.Connect())\n    return 0\n}\n"
     fs.WriteAll(cache.JoinPath(projDir, "app_explicit.skink"), explicitSrc)
     _, rcBuild1 := os.ExecWithOutput([]string{"skink", "-o", cache.JoinPath(projDir, "app_explicit"), cache.JoinPath(projDir, "app_explicit.skink")})
-    testing.AssertEqualInt(0, rcBuild1, "skink should compile import \"mod/markoxley/skink-orm@v1.0.2\"")
+    testing.AssertEqualInt(0, rcBuild1, "skink should compile import \"mod/markoxley/skink-tegu@v1.0.2\"")
     runOut1, rcRun1 := os.ExecWithOutput([]string{cache.JoinPath(projDir, "app_explicit")})
     testing.AssertEqualInt(0, rcRun1, "compiled app_explicit should exit 0")
-    testing.AssertEqualString("orm-v1.0.2", str.Trim(runOut1), "explicit @v1.0.2 binary prints orm-v1.0.2")
+    testing.AssertEqualString("tegu-v1.0.2", str.Trim(runOut1), "explicit @v1.0.2 binary prints tegu-v1.0.2")
 
     // 7. Compile and run a Skink source file omitting @version (resolves to v1.1.0)
-    latestSrc := "module main\n\nimport \"mod/markoxley/skink-orm\"\n\nfn main() -> int {\n    println(orm.Connect())\n    return 0\n}\n"
+    latestSrc := "module main\n\nimport \"mod/markoxley/skink-tegu\"\n\nfn main() -> int {\n    println(tegu.Connect())\n    return 0\n}\n"
     fs.WriteAll(cache.JoinPath(projDir, "app_latest.skink"), latestSrc)
     _, rcBuild2 := os.ExecWithOutput([]string{"skink", "-o", cache.JoinPath(projDir, "app_latest"), cache.JoinPath(projDir, "app_latest.skink")})
-    testing.AssertEqualInt(0, rcBuild2, "skink should compile import \"mod/markoxley/skink-orm\"")
+    testing.AssertEqualInt(0, rcBuild2, "skink should compile import \"mod/markoxley/skink-tegu\"")
     runOut2, rcRun2 := os.ExecWithOutput([]string{cache.JoinPath(projDir, "app_latest")})
     testing.AssertEqualInt(0, rcRun2, "compiled app_latest should exit 0")
-    testing.AssertEqualString("orm-v1.1.0", str.Trim(runOut2), "omitted @version binary prints orm-v1.1.0")
+    testing.AssertEqualString("tegu-v1.1.0", str.Trim(runOut2), "omitted @version binary prints tegu-v1.1.0")
 
     os.Chdir(origCwd)
     cache.RemoveDirRecursive(testBase)
+}
+
+// TestLinkSectionEndToEnd verifies that a cached package declaring a
+// [link] section (a C source compiled into the binary plus a system
+// library) is honored by the compiler driver when a consumer program
+// imports it. This exercises the full chain: mirror -> scales add ->
+// cache -> skink driver [link] resolution -> clang.
+pub fn TestLinkSectionEndToEnd() {
+    testBase := "/tmp/scales_link_e2e"
+    cache.RemoveDirRecursive(testBase)
+
+    mirrorDir := cache.JoinPath(testBase, "mirror")
+    cacheDir := cache.JoinPath(testBase, "scales_cache")
+    projDir := cache.JoinPath(testBase, "app")
+
+    // The package ships a C source file and links libm; the consumer's
+    // extern declaration resolves against the compiled probe function.
+    pkg := cache.JoinPath(mirrorDir, "markoxley/skink-probe/v0.1.0")
+    cache.MkdirAll(cache.JoinPath(pkg, "native"))
+    cache.MkdirAll(projDir)
+    fs.WriteAll(cache.JoinPath(pkg, "skink.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nauthor = \"markoxley\"\nentry = \"probe.skink\"\n\n" +
+        "[target]\nenv = \"std\"\nno_std = false\nos = \"any\"\narch = \"any\"\n\n" +
+        "[link]\nsources = [\"native/probe.c\"]\nlibs = [\"m\"]\n")
+    fs.WriteAll(cache.JoinPath(pkg, "probe.skink"),
+        "module probe\n\nextern fn skink_probe_answer() -> int\n\npub fn Answer() -> int {\n    return skink_probe_answer()\n}\n")
+    fs.WriteAll(cache.JoinPath(pkg, "native/probe.c"),
+        "int skink_probe_answer(void) { return 42; }\n")
+
+    os.Setenv("SCALES_CACHE_DIR", cacheDir)
+    os.Setenv("SCALES_GITHUB_MIRROR", mirrorDir)
+
+    scalesBin := cache.JoinPath(os.Getwd(), "scales")
+    skinkBin := os.Getenv("SKINK")
+    if str.Len(skinkBin) == 0 {
+        skinkBin = "skink"
+    }
+    origCwd := os.Getwd()
+    os.Chdir(projDir)
+
+    _, rcInit := os.ExecWithOutput([]string{scalesBin, "init", "link-app"})
+    testing.AssertEqualInt(0, rcInit, "scales init should exit 0")
+    _, rcAdd := os.ExecWithOutput([]string{scalesBin, "add", "mod/markoxley/skink-probe"})
+    testing.AssertEqualInt(0, rcAdd, "scales add should exit 0")
+    testing.AssertTrue(cache.IsPackageCached("markoxley", "skink-probe", "v0.1.0"), "package cached")
+
+    consumer := "module main\n\nimport \"mod/markoxley/skink-probe\"\n\nfn main() -> int {\n    println(probe.Answer())\n    return 0\n}\n"
+    fs.WriteAll(cache.JoinPath(projDir, "app.skink"), consumer)
+    _, rcBuild := os.ExecWithOutput([]string{skinkBin, "-o", cache.JoinPath(projDir, "app"), cache.JoinPath(projDir, "app.skink")})
+    testing.AssertEqualInt(0, rcBuild, "consumer compiles — [link] source compiled and linked")
+    runOut, rcRun := os.ExecWithOutput([]string{cache.JoinPath(projDir, "app")})
+    testing.AssertEqualInt(0, rcRun, "compiled consumer runs")
+    testing.AssertEqualString("42", str.Trim(runOut), "C source from package [link] was compiled in")
+
+    os.Chdir(origCwd)
+    cache.RemoveDirRecursive(testBase)
+}
+
+// TestUnsafeVersionRejected guards comp_error.md #158: version strings
+// with a leading '-' (git option injection) or path metacharacters must
+// be rejected by ParseSpec and FetchPackage.
+pub fn TestUnsafeVersionRejected() {
+    s := modres.ParseSpec("mod/o/r@--upload-pack=/tmp/evil", true)
+    testing.AssertFalse(s.Valid, "leading-dash version rejected")
+    s2 := modres.ParseSpec("mod/o/r@../../x", true)
+    testing.AssertFalse(s2.Valid, "dotdot version rejected")
+    s3 := modres.ParseSpec("mod/o/r@v1.0.0", true)
+    testing.AssertTrue(s3.Valid, "valid version accepted")
+    // FetchPackage validates too (versions also come from skink.lock).
+    _, ferr := cache.FetchPackage("o", "r", "--upload-pack=x", true)
+    testing.AssertTrue(ferr.message != "", "FetchPackage rejects unsafe version")
+}
+
+// TestTarMemberUnsafe guards comp_error.md #158: archive members with
+// ".."/absolute segments must be flagged as unsafe.
+pub fn TestTarMemberUnsafe() {
+    testing.AssertTrue(cache.TarMemberUnsafe("../../evil"), ".. member unsafe")
+    testing.AssertTrue(cache.TarMemberUnsafe("top/../../evil"), "post-strip .. unsafe")
+    testing.AssertTrue(cache.TarMemberUnsafe("/etc/passwd"), "absolute member unsafe")
+    testing.AssertFalse(cache.TarMemberUnsafe("top/file.skink"), "normal member safe")
+    testing.AssertFalse(cache.TarMemberUnsafe("top/"), "trailing-slash dir member safe")
 }

@@ -12,13 +12,13 @@ Third-party modules are imported directly in Skink source files using the `mod/<
 module main
 
 // Explicit version specifier:
-import "mod/markoxley/skink-orm@v1.0.2"
+import "mod/markoxley/skink-tegu@v1.0.2"
 
 // Omitted version specifier (resolves via skink.lock / skink.toml or latest version):
-import "mod/markoxley/skink-orm"
+import "mod/markoxley/skink-tegu"
 
 // Optional import alias:
-import "mod/markoxley/skink-orm@v1.0.2" as orm
+import "mod/markoxley/skink-tegu@v1.0.2" as orm
 ```
 
 ---
@@ -44,7 +44,7 @@ os = "any"           # "any", "linux", "windows", "darwin", "none"
 arch = "any"         # "any", "x86_64", "arm64", "riscv64"
 
 [dependencies]
-"mod/markoxley/skink-orm" = "v1.0.2"
+"mod/markoxley/skink-tegu" = "v1.0.2"
 "mod/markoxley/skink-hal" = { version = "^0.2.0", target = "no-std" }
 ```
 
