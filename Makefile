@@ -17,7 +17,7 @@ SCALES_MAIN  := scales.skink
 SCALES_PKGS  := $(wildcard pkg/*.skink) version.skink
 
 .DEFAULT_GOAL := all
-.PHONY: all build check test install uninstall clean help
+.PHONY: all build check test pkgcrawl install uninstall clean help
 
 all: build
 
@@ -31,6 +31,13 @@ $(SCALES_BIN): $(SCALES_MAIN) $(SCALES_PKGS)
 check:
 	@echo "Type-checking scales..."
 	SKINK_HOME=$(SKINK_HOME) $(SKINK) -check $(SCALES_MAIN)
+	SKINK_HOME=$(SKINK_HOME) $(SKINK) -check pkgcrawl.skink
+
+# pkgcrawl builds the docs package-index crawler (docs/packages.php feeder).
+pkgcrawl: pkgcrawl.skink $(SCALES_PKGS)
+	@echo "Building pkgcrawl..."
+	SKINK_HOME=$(SKINK_HOME) $(SKINK) -o pkgcrawl pkgcrawl.skink
+	@echo "Built: pkgcrawl"
 
 test: build
 	@echo "Running scales test suite..."
@@ -47,12 +54,13 @@ uninstall:
 	rm -f $(BINDIR)/$(SCALES_BIN)
 
 clean:
-	rm -f $(SCALES_BIN) *.ll *.o __skink_test_bin*
+	rm -f $(SCALES_BIN) pkgcrawl *.ll *.o __skink_test_bin*
 
 help:
 	@echo "scales Build System"
 	@echo "  make          - Build scales binary"
 	@echo "  make check    - Type-check only"
 	@echo "  make test     - Run unit & integration tests"
+	@echo "  make pkgcrawl - Build the docs package-index crawler"
 	@echo "  make install  - Install scales to $(BINDIR)"
 	@echo "  make clean    - Remove build artifacts"

@@ -1,0 +1,182 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: Scales — Official package manager and module resolution system
+//          for the Skink programming language.
+//
+// File:    pkgcrawl.skink
+// Purpose: Package-index crawler for the Skink website's pkg.go.dev-style
+//          docs (docs/packages.php). Reads a list of mod/<owner>/<repo>
+//          paths, resolves each to a source tree — a local modules/<repo>
+//          checkout when present, otherwise the scales package cache via
+//          the same ResolveVersion/FetchPackage machinery `scales add`
+//          uses — and writes a JSON manifest that docs/extract.php
+//          consumes.
+//
+// Usage (typically run from skink-website/docs):
+//   pkgcrawl [--packages data/packages.txt] [--out data/pkgs.json]
+//            [--mods ../../modules] [--offline]
+//
+// Author:  Mark Oxley
+// Created: 2026
+
+module main
+
+import "std/os"
+import "std/fs"
+import "std/str"
+import "std/strconv"
+import "pkg/modres"
+import "pkg/cache"
+
+// printUsage prints the pkgcrawl usage and flag summary.
+fn printUsage() {
+    println("pkgcrawl — resolve Skink packages to source trees for the docs index")
+    println("")
+    println("Usage:")
+    println("  pkgcrawl [--packages FILE] [--out FILE] [--mods DIR] [--offline]")
+    println("")
+    println("Flags:")
+    println("  --packages FILE   mod/<owner>/<repo> list, one per line   (default data/packages.txt)")
+    println("  --out FILE        JSON manifest written for extract.php   (default data/pkgs.json)")
+    println("  --mods DIR        local checkout dir consulted first      (default ../../modules)")
+    println("  --offline         never hit the network; cache misses are skipped")
+}
+
+// jsonEscape returns s with the characters JSON strings cannot contain
+// escaped. Package paths and dirs are filesystem-clean already, so only
+// quotes, backslashes and control characters need handling.
+fn jsonEscape(s: string) -> string {
+    out := ""
+    n := str.Len(s)
+    i := 0
+    for i < n {
+        c := int(s[i])
+        if c == 34 {
+            out = str.Concat(out, "\\\"")
+        } else if c == 92 {
+            out = str.Concat(out, "\\\\")
+        } else if c < 32 {
+            out = str.Concat(out, " ")
+        } else {
+            out = str.Concat(out, str.Substr(s, i, 1))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// flagValue returns the value following --name in args, or "" when absent.
+fn flagValue(args: []string, name: string) -> string {
+    i := 0
+    for i < len(args) - 1 {
+        if str.Equal(args[i], name) {
+            return args[i + 1]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// hasFlag reports whether --name appears anywhere in args.
+fn hasFlag(args: []string, name: string) -> bool {
+    i := 0
+    for i < len(args) {
+        if str.Equal(args[i], name) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() -> int {
+    args := os.Args()
+    if hasFlag(args, "--help") || hasFlag(args, "-h") {
+        printUsage()
+        return 0
+    }
+
+    packagesFile := flagValue(args, "--packages")
+    if str.Len(packagesFile) == 0 {
+        packagesFile = "data/packages.txt"
+    }
+    outFile := flagValue(args, "--out")
+    if str.Len(outFile) == 0 {
+        outFile = "data/pkgs.json"
+    }
+    modsDir := flagValue(args, "--mods")
+    if str.Len(modsDir) == 0 {
+        modsDir = "../../modules"
+    }
+    offline := hasFlag(args, "--offline")
+
+    cwd := os.Getwd()
+
+    src, rerr := fs.ReadAll(packagesFile)
+    if rerr.message != "" {
+        println(str.Concat("error: cannot read ", str.Concat(packagesFile, str.Concat(" (", str.Concat(rerr.message, ")")))))
+        return 1
+    }
+
+    entries := ""
+    count := 0
+    lines := str.Split(src, "\n")
+    li := 0
+    for li < len(lines) {
+        spec := modres.ParseSpec(lines[li], false)
+        li = li + 1
+        // ParseSpec tolerates @version and subpaths; the index only lists
+        // bare mod/<owner>/<repo> lines (comments/blank lines fail Valid).
+        if !spec.Valid || str.Len(spec.Version) > 0 || str.Len(spec.Subpath) > 0 {
+            continue
+        }
+        key := spec.CanonicalKey
+
+        dir := ""
+        source := ""
+        // 1. Prefer a local checkout so the docs mirror the working tree.
+        local := cache.JoinPath(modsDir, spec.Repo)
+        if fs.IsDir(local) {
+            dir = cache.JoinPath(cwd, local)
+            source = "local"
+            println(str.Concat(key, str.Concat(" -> local ", dir)))
+        } else {
+            // 2. Resolve and fetch through the scales cache machinery —
+            //    the same code path `scales add` exercises.
+            ver, verr := cache.ResolveVersion(spec.Owner, spec.Repo, "latest", false, offline)
+            if verr.message != "" {
+                println(str.Concat("warn: ", str.Concat(key, str.Concat(" — ", verr.message))))
+                continue
+            }
+            pkg, ferr := cache.FetchPackage(spec.Owner, spec.Repo, ver, offline)
+            if ferr.message != "" {
+                println(str.Concat("warn: ", str.Concat(key, str.Concat(" — ", ferr.message))))
+                continue
+            }
+            dir = pkg.InstallDir
+            source = pkg.Source
+            println(str.Concat(key, str.Concat(" -> ", str.Concat(source, str.Concat("@", pkg.Version)))))
+        }
+        if str.Len(dir) == 0 {
+            continue
+        }
+
+        if count > 0 {
+            entries = str.Concat(entries, ",\n")
+        }
+        entry := str.Concat("  {\"path\": \"", jsonEscape(key))
+        entry = str.Concat(entry, str.Concat("\", \"dir\": \"", jsonEscape(dir)))
+        entry = str.Concat(entry, str.Concat("\", \"source\": \"", jsonEscape(source)))
+        entries = str.Concat(entries, str.Concat(entry, "\"}"))
+        count = count + 1
+    }
+
+    body := str.Concat("[\n", str.Concat(entries, "\n]\n"))
+    werr := fs.WriteAll(outFile, body)
+    if werr.message != "" {
+        println(str.Concat("error: cannot write ", str.Concat(outFile, str.Concat(" (", str.Concat(werr.message, ")")))))
+        return 1
+    }
+    println(str.Concat("Resolved ", str.Concat(strconv.Itoa(count), str.Concat(" package(s) -> ", outFile))))
+    return 0
+}
